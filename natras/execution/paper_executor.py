@@ -53,13 +53,40 @@ class PaperExecutor:
         safety_guard: SafetyGuard,
         risk_governor: RiskGovernor,
         settings: Settings,
+        entry_slippage: float = 0.0,
+        exit_slippage: float = 0.0,
+        brokerage_per_order: float = 0.0,
+        risk_profile_id: str = "v2.2.0-research-momentum-wick-default",
     ) -> None:
         self.db = db
         self.safety_guard = safety_guard
         self.risk_governor = risk_governor
         self.settings = settings
+        self.entry_slippage = entry_slippage
+        self.exit_slippage = exit_slippage
+        self.brokerage_per_order = brokerage_per_order
+        self.risk_profile_id = risk_profile_id
         self.daily_realized_pnl = 0.0
         self.daily_trades_count = 0
+
+    @classmethod
+    def with_realistic_assumptions(
+        cls,
+        db: DatabaseManager,
+        safety_guard: SafetyGuard,
+        risk_governor: RiskGovernor,
+        settings: Settings,
+    ) -> "PaperExecutor":
+        """Factory initializing PaperExecutor with realistic slippage and brokerage."""
+        return cls(
+            db=db,
+            safety_guard=safety_guard,
+            risk_governor=risk_governor,
+            settings=settings,
+            entry_slippage=0.50,
+            exit_slippage=0.50,
+            brokerage_per_order=20.0,
+        )
 
     def submit_order(
         self,
@@ -143,8 +170,14 @@ class PaperExecutor:
                 message=order.reason,
             )
 
-        # 3. Paper Order Fill Simulation (Executed at provided real market price)
-        fill_price = price
+        # 3. Paper Order Fill Simulation (Executed at provided real market price + slippage)
+        if side_val == OrderSide.BUY.value:
+            slip = self.entry_slippage if intent_val == OrderIntent.ENTRY.value else self.exit_slippage
+            fill_price = round(price + slip, 2)
+        else:
+            slip = self.entry_slippage if intent_val == OrderIntent.ENTRY.value else self.exit_slippage
+            fill_price = round(price - slip, 2)
+
         order.status = OrderStatus.FILLED.value
         order.fill_price = fill_price
         order.executed_at = now_iso
@@ -174,8 +207,16 @@ class PaperExecutor:
                 event_type="POSITION_OPENED",
                 strategy_id=strategy_id,
                 symbol=symbol,
-                payload={"position_id": position_id, "side": side_val, "qty": quantity, "price": fill_price},
-                message=f"Opened position {position_id} for {symbol} at {fill_price}",
+                payload={
+                    "position_id": position_id,
+                    "side": side_val,
+                    "qty": quantity,
+                    "price": fill_price,
+                    "quoted_price": price,
+                    "slippage": slip,
+                    "risk_profile_id": self.risk_profile_id,
+                },
+                message=f"Opened position {position_id} for {symbol} at {fill_price} (quoted {price}, slippage {slip})",
             )
         else:
             # EXIT intent: matched to existing open position for this symbol
@@ -194,8 +235,13 @@ class PaperExecutor:
             event_type="ORDER_FILLED",
             strategy_id=strategy_id,
             symbol=symbol,
-            payload={"client_order_id": cid, "fill_price": fill_price, "position_id": position_id},
-            message=f"Paper order {cid} filled at {fill_price}",
+            payload={
+                "client_order_id": cid,
+                "fill_price": fill_price,
+                "position_id": position_id,
+                "slippage": slip,
+            },
+            message=f"Paper order {cid} filled at {fill_price} (quoted {price}, slippage {slip})",
         )
 
         return ExecutionResult(
@@ -229,6 +275,10 @@ class PaperExecutor:
 
         now_ist = self.safety_guard.to_ist(current_dt)
         exit_side = OrderSide.SELL.value if pos.side == OrderSide.BUY.value else OrderSide.BUY.value
+        if exit_side == OrderSide.SELL.value:
+            actual_fill_price = round(exit_price - self.exit_slippage, 2)
+        else:
+            actual_fill_price = round(exit_price + self.exit_slippage, 2)
 
         # Submit exit order
         cid = f"exit_{uuid.uuid4().hex[:12]}"
@@ -241,7 +291,7 @@ class PaperExecutor:
             intent=OrderIntent.EXIT.value,
             quantity=pos.quantity,
             price=exit_price,
-            fill_price=exit_price,
+            fill_price=actual_fill_price,
             status=OrderStatus.FILLED.value,
             created_at=now_ist.isoformat(),
             executed_at=now_ist.isoformat(),
@@ -252,7 +302,7 @@ class PaperExecutor:
 
         self._close_position_record(
             pos=pos,
-            exit_price=exit_price,
+            exit_price=actual_fill_price,
             closed_at=now_ist.isoformat(),
             reason=reason,
         )
@@ -261,9 +311,9 @@ class PaperExecutor:
             success=True,
             order_id=cid,
             status=OrderStatus.FILLED,
-            fill_price=exit_price,
+            fill_price=actual_fill_price,
             position_id=position_id,
-            message=f"Position {position_id} closed at {exit_price} ({reason}).",
+            message=f"Position {position_id} closed at {actual_fill_price} ({reason}).",
         )
 
     def update_positions_on_candle(
@@ -340,14 +390,17 @@ class PaperExecutor:
     ) -> None:
         """Calculate realized PnL and persist closed position."""
         if str(pos.side) == OrderSide.BUY.value:
-            pnl = (exit_price - pos.entry_price) * pos.quantity
+            gross_pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
-            pnl = (pos.entry_price - exit_price) * pos.quantity
+            gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+
+        total_brokerage = round(self.brokerage_per_order * 2.0, 2)  # ₹20 entry + ₹20 exit
+        net_pnl = round(gross_pnl - total_brokerage, 2)
 
         pos.current_price = exit_price
         pos.closed_at = closed_at
         pos.status = PositionStatus.CLOSED.value
-        pos.realized_pnl = round(pnl, 2)
+        pos.realized_pnl = net_pnl
         self.db.save_position(pos)
 
         self.daily_realized_pnl += pos.realized_pnl
@@ -359,10 +412,16 @@ class PaperExecutor:
             payload={
                 "position_id": pos.position_id,
                 "exit_price": exit_price,
+                "gross_pnl": round(gross_pnl, 2),
+                "brokerage": total_brokerage,
                 "realized_pnl": pos.realized_pnl,
+                "risk_profile_id": self.risk_profile_id,
                 "reason": reason,
             },
-            message=f"Closed position {pos.position_id} with PnL {pos.realized_pnl:.2f} ({reason})",
+            message=(
+                f"Closed position {pos.position_id} with net PnL {pos.realized_pnl:.2f} "
+                f"(Gross: {gross_pnl:.2f}, Brokerage: {total_brokerage:.2f}) [{reason}]"
+            ),
         )
 
     def _journal_event(

@@ -60,14 +60,27 @@ def to_ist_iso(raw_ts):
 
 def save(db, rows, retrieved_at):
     before = db.total_changes
+    cols = {r[1] for r in db.execute('PRAGMA table_info(candles)').fetchall()}
+    has_oi = 'open_interest' in cols
     for c in rows:
         if len(c) < 6 or None in c[1:5]:
             continue
-        db.execute(
-            'INSERT OR IGNORE INTO candles VALUES (?,?,?,?,?,?,?,?,?)',
-            (DB_SYMBOL, to_ist_iso(c[0]), c[1], c[2], c[3], c[4], c[5] or 0,
-             'upstox_history', retrieved_at),
-        )
+        vol = float(c[5]) if len(c) > 5 and c[5] is not None else 0.0
+        if has_oi:
+            oi = float(c[6]) if len(c) > 6 and c[6] is not None else 0.0
+            db.execute(
+                'INSERT OR IGNORE INTO candles (symbol, ts, open, high, low, close, volume, source, retrieved_at, open_interest) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (DB_SYMBOL, to_ist_iso(c[0]), c[1], c[2], c[3], c[4], vol,
+                 'upstox_history', retrieved_at, oi),
+            )
+        else:
+            db.execute(
+                'INSERT OR IGNORE INTO candles (symbol, ts, open, high, low, close, volume, source, retrieved_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?)',
+                (DB_SYMBOL, to_ist_iso(c[0]), c[1], c[2], c[3], c[4], vol,
+                 'upstox_history', retrieved_at),
+            )
     db.commit()
     return db.total_changes - before
 
@@ -87,6 +100,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--days', type=int, default=365)
     parser.add_argument('--interval', type=int, default=5)
+    parser.add_argument('--from-date', type=str, default=None, help='Start date YYYY-MM-DD (e.g. 2023-01-01)')
+    parser.add_argument('--to-date', type=str, default=None, help='End date YYYY-MM-DD')
     args = parser.parse_args()
 
     token = os.environ.get('UPSTOX_ACCESS_TOKEN', '')
@@ -100,8 +115,8 @@ def main() -> int:
     db = sqlite3.connect(DB_PATH)
     db.execute(SCHEMA)
 
-    end = date.today()
-    overall_start = end - timedelta(days=args.days)
+    end = date.fromisoformat(args.to_date) if args.to_date else date.today()
+    overall_start = date.fromisoformat(args.from_date) if args.from_date else (end - timedelta(days=args.days))
     retrieved_at = datetime.now(IST).isoformat()
     seen = Counter()
     inserted = 0

@@ -180,3 +180,45 @@ def test_paper_executor_journal_persisted(paper_executor: PaperExecutor):
     events = [e.event_type for e in entries]
     assert "POSITION_OPENED" in events
     assert "ORDER_FILLED" in events
+
+
+def test_paper_executor_realistic_slippage_and_brokerage(db, safety_guard, risk_governor, settings):
+    executor = PaperExecutor.with_realistic_assumptions(
+        db=db,
+        safety_guard=safety_guard,
+        risk_governor=risk_governor,
+        settings=settings,
+    )
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+
+    # 1. Entry Buy: quoted at 100.0, fills at 100.50
+    entry_res = executor.submit_order(
+        strategy_id="v2.2.0-RESEARCH-MOMENTUM-WICK",
+        symbol="NSE:NIFTY26O1317350CE",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=65,
+        price=100.0,
+        current_dt=dt_morning,
+    )
+    assert entry_res.success is True
+    assert entry_res.fill_price == 100.50
+    pos_id = entry_res.position_id
+
+    # 2. Exit Sell: quoted at 110.0, fills at 109.50
+    dt_exit = datetime(2026, 10, 14, 10, 25, 0, tzinfo=TZ)
+    exit_res = executor.close_position(
+        position_id=pos_id,
+        exit_price=110.0,
+        current_dt=dt_exit,
+        reason="TRAILING_STOP",
+    )
+    assert exit_res.success is True
+    assert exit_res.fill_price == 109.50
+
+    # Net PnL = (109.50 - 100.50) * 65 - 40.0 = 9.0 * 65 - 40 = 585.0 - 40 = 545.0
+    pos = executor.db.get_position(pos_id)
+    assert pos.realized_pnl == 545.0
+    assert executor.daily_realized_pnl == 545.0
+

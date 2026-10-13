@@ -65,7 +65,21 @@ def main() -> int:
     feed = FyersFeed(creds.app_id, token, symbols, on_candle)
     threading.Thread(target=feed.start, daemon=True).start()
 
+    # Initialize Market Intelligence settlement engine
+    try:
+        from natras.db.database import DatabaseManager
+        from natras.market_intelligence.orchestrator import MarketIntelligenceOrchestrator
+        natras_db = DatabaseManager()
+        orch = MarketIntelligenceOrchestrator(db_manager=natras_db)
+        print('Settling initial market intelligence & news snapshot...', flush=True)
+        orch.poll_and_settle(natras_db)
+    except Exception as exc:
+        print(f'Warning: Market intelligence initialization skipped: {exc}', flush=True)
+        orch = None
+        natras_db = None
+
     last_health = 0.0
+    last_intel = time.time()
     try:
         while True:
             now = datetime.now(IST)
@@ -77,10 +91,27 @@ def main() -> int:
                 st = feed.get_status()
                 if not st['healthy']:
                     print(f"UNHEALTHY: {st['last_error']}", flush=True)
+
+            # Periodically poll and settle market intelligence every 15 minutes
+            if orch and (time.time() - last_intel > 900):
+                last_intel = time.time()
+                try:
+                    orch.poll_and_settle(natras_db)
+                    print(f'[{now:%H:%M}] Market intelligence & news snapshot settled.', flush=True)
+                except Exception as exc:
+                    print(f'Market intelligence periodic settlement warning: {exc}', flush=True)
+
             time.sleep(2)
     finally:
         feed.stop()
         db.close()
+        # Final EOD settlement
+        if orch:
+            try:
+                orch.poll_and_settle(natras_db)
+                print('Final EOD market intelligence settled.', flush=True)
+            except Exception:
+                pass
     print('Collector stopped.', flush=True)
     return 0
 

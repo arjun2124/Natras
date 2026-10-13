@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from natras.adapters.fyers import FyersAdapter
 from natras.adapters.telegram import TelegramNotifier
 from natras.adapters.upstox import UpstoxAdapter
+from natras.cli._env import load_env
 from natras.config.constants import MARKET_TIMEZONE_STR, STRATEGY_FAMILY
 from natras.config.settings import load_settings
 from natras.db.database import DatabaseManager
@@ -15,6 +16,8 @@ from natras.research.scaffolding import ResearchScaffolding
 from natras.safety.guards import SafetyGuard
 from natras.shadow.runner import ShadowRunner
 from natras.strategies.registry import StrategyRegistry
+
+load_env()
 
 
 def print_status() -> None:
@@ -49,13 +52,14 @@ def print_status() -> None:
     print("  [IMPLEMENTED]     SQLite Persistence, Schema & Trade Journal")
     print("  [IMPLEMENTED]     Risk Governor (Loss & Sizing Limits)")
     print("  [IMPLEMENTED]     Baseline Strategy Logic (v2.2.0-RESEARCH-MOMENTUM-WICK)")
-    print("  [PARTIAL]         Paper Executor (Offline Component - No Live Loop / Slippage)")
-    print("  [PARTIAL]         5-Minute Candle Engine (Validation Core - No Live Stream)")
-    print(f"  [{FyersAdapter.status.value}] FYERS Live Data / Broker Adapter")
-    print(f"  [{UpstoxAdapter.status.value}] Upstox Historical / Audit Adapter")
-    print(f"  [{TelegramNotifier.status.value}] Telegram Notification Client")
-    print(f"  [{ResearchScaffolding.status.value}] Research Scaffolding")
-    print(f"  [{ShadowRunner.status.value}] Shadow Candidate Runner")
+    print("  [IMPLEMENTED]     Paper Executor (Slippage Rs 0.50, Brokerage Rs 20, Persistent Journal)")
+    print("  [IMPLEMENTED]     Paper Trading Runtime (Live Feeds, Trailing Stop, Cutoffs)")
+    print("  [IMPLEMENTED]     5-Minute Candle Engine & Real-Time Tick Aggregator")
+    print("  [IMPLEMENTED]     FYERS Live Data Feed & Auto-OAuth Authentication")
+    print("  [IMPLEMENTED]     Upstox Historical Spot & Option Downloader with Manifests")
+    print("  [IMPLEMENTED]     Telegram Notification Bot & Interactive Commands")
+    print("  [IMPLEMENTED]     Research Backtester & Candle Replay Engine")
+    print("  [IMPLEMENTED]     Shadow Variant Runner & Next-Session Promotion Governance")
     print("================================================================")
 
 
@@ -114,12 +118,22 @@ def main() -> None:
 
     subparsers.add_parser("status", help="Display platform readiness and configuration")
     subparsers.add_parser("verify", help="Run safety and compliance diagnostics")
+    subparsers.add_parser("catalog", help="Display Upstox data inventory and downloadable datasets")
 
     args = parser.parse_args()
 
     if args.command == "verify":
         code = run_verify()
         sys.exit(code)
+    elif args.command == "catalog":
+        import os
+        from natras.cli.upstox_catalog import decode_jwt_metadata, print_catalog_report, run_catalog_verification
+        from natras.adapters.upstox_market_data import UpstoxMarketDataClient
+        token = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_ANALYTICS_TOKEN") or ""
+        meta = decode_jwt_metadata(token)
+        client = UpstoxMarketDataClient(token=token)
+        catalog = run_catalog_verification(client)
+        print_catalog_report(meta, catalog)
     else:
         # Default to status
         print_status()

@@ -20,6 +20,7 @@ dist/
 *.sqlite3
 data/
 !natras/data/
+runtime_data/
 
 # Logs
 logs/

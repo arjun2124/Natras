@@ -4,7 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from natras.db.models import (
     AuditLogRecord,
@@ -84,11 +84,59 @@ CREATE TABLE IF NOT EXISTS candles (
     UNIQUE(symbol, timeframe, timestamp)
 );
 
+CREATE TABLE IF NOT EXISTS market_intelligence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    trend_regime TEXT NOT NULL,
+    volatility_regime TEXT NOT NULL,
+    global_sentiment TEXT NOT NULL,
+    pcr REAL,
+    max_pain REAL,
+    vix REAL,
+    fii_net_amount REAL,
+    dii_net_amount REAL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    news_id TEXT UNIQUE NOT NULL,
+    source TEXT NOT NULL,
+    url TEXT,
+    published_at TEXT NOT NULL,
+    category TEXT NOT NULL,
+    sector TEXT,
+    headline TEXT NOT NULL,
+    summary TEXT,
+    importance TEXT NOT NULL,
+    retrieved_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS economic_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT UNIQUE NOT NULL,
+    source TEXT NOT NULL,
+    url_reference TEXT,
+    publication_time TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    category TEXT NOT NULL,
+    affected_sector TEXT,
+    importance TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    actual_value TEXT,
+    previous_value TEXT,
+    consensus_value TEXT,
+    market_reaction TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_strategy ON orders(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles(symbol, timeframe, timestamp);
+CREATE INDEX IF NOT EXISTS idx_intel_timestamp ON market_intelligence(timestamp);
+CREATE INDEX IF NOT EXISTS idx_news_published ON news_items(published_at);
+CREATE INDEX IF NOT EXISTS idx_events_time ON economic_events(publication_time);
 """
 
 
@@ -150,12 +198,12 @@ class DatabaseManager:
                     order.client_order_id,
                     order.strategy_id,
                     order.symbol,
-                    str(order.side),
-                    str(order.order_type),
-                    str(order.intent),
+                    order.side.value if hasattr(order.side, "value") else str(order.side),
+                    order.order_type.value if hasattr(order.order_type, "value") else str(order.order_type),
+                    order.intent.value if hasattr(order.intent, "value") else str(order.intent),
                     order.quantity,
                     order.price,
-                    str(order.status),
+                    order.status.value if hasattr(order.status, "value") else str(order.status),
                     order.fill_price,
                     now_str,
                     order.executed_at,
@@ -244,13 +292,13 @@ class DatabaseManager:
                     pos.position_id,
                     pos.strategy_id,
                     pos.symbol,
-                    str(pos.side),
+                    pos.side.value if hasattr(pos.side, "value") else str(pos.side),
                     pos.quantity,
                     pos.entry_price,
                     pos.current_price,
                     pos.stop_loss,
                     pos.take_profit,
-                    str(pos.status),
+                    pos.status.value if hasattr(pos.status, "value") else str(pos.status),
                     now_str,
                     pos.closed_at,
                     pos.realized_pnl,
@@ -429,3 +477,140 @@ class DatabaseManager:
                 )
                 for row in rows
             ]
+
+    # Market Intelligence API
+    def save_market_intelligence_snapshot(self, snapshot: Dict[str, Any]) -> int:
+        """Persist a consolidated market intelligence snapshot."""
+        now_iso = snapshot.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        regime = snapshot.get("regime") or {}
+        pcr = snapshot.get("pcr")
+        max_pain = snapshot.get("max_pain")
+        vix = snapshot.get("vix")
+        fii = snapshot.get("fii_net_amount")
+        dii = snapshot.get("dii_net_amount")
+        payload = json.dumps(snapshot)
+
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO market_intelligence (
+                    timestamp, trend_regime, volatility_regime, global_sentiment,
+                    pcr, max_pain, vix, fii_net_amount, dii_net_amount, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso,
+                    regime.get("trend_regime", "UNKNOWN"),
+                    regime.get("volatility_regime", "NORMAL"),
+                    regime.get("global_sentiment", "NEUTRAL"),
+                    pcr,
+                    max_pain,
+                    vix,
+                    fii,
+                    dii,
+                    payload,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_latest_market_intelligence(self) -> Optional[Dict[str, Any]]:
+        """Fetch the most recent market intelligence snapshot."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json FROM market_intelligence
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row["payload_json"])
+                except Exception:
+                    return None
+            return None
+
+    # News & Macro Events API
+    def save_news_item(self, item: Dict[str, Any]) -> None:
+        """Insert or ignore a news item."""
+        retrieved_at = item.get("retrieved_at") or datetime.now(timezone.utc).isoformat()
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO news_items (
+                    news_id, source, url, published_at, category, sector,
+                    headline, summary, importance, retrieved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.get("news_id", ""),
+                    item.get("source", ""),
+                    item.get("url", ""),
+                    item.get("published_at", ""),
+                    item.get("category", ""),
+                    item.get("sector", ""),
+                    item.get("headline", ""),
+                    item.get("summary", ""),
+                    item.get("importance", "MEDIUM"),
+                    retrieved_at,
+                ),
+            )
+
+    def get_recent_news_items(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieve recent news items ordered by publish date."""
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT news_id, source, url, published_at, category, sector,
+                       headline, summary, importance, retrieved_at
+                FROM news_items
+                ORDER BY published_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def save_economic_event(self, event: Dict[str, Any]) -> None:
+        """Insert or replace a scheduled economic event."""
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO economic_events (
+                    event_id, source, url_reference, publication_time, timezone,
+                    category, affected_sector, importance, headline,
+                    actual_value, previous_value, consensus_value, market_reaction
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    actual_value=excluded.actual_value,
+                    previous_value=excluded.previous_value,
+                    market_reaction=excluded.market_reaction;
+                """,
+                (
+                    event.get("event_id", ""),
+                    event.get("source", ""),
+                    event.get("url_reference", ""),
+                    event.get("publication_time", ""),
+                    event.get("timezone", "Asia/Kolkata"),
+                    event.get("category", ""),
+                    event.get("affected_sector", ""),
+                    event.get("importance", "MEDIUM"),
+                    event.get("headline", ""),
+                    event.get("actual_value"),
+                    event.get("previous_value"),
+                    event.get("consensus_value"),
+                    event.get("market_reaction"),
+                ),
+            )
+
+    def get_upcoming_economic_events(self, since_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve upcoming economic events."""
+        dt_str = since_date or datetime.now(timezone.utc).isoformat()[:10]
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM economic_events
+                WHERE publication_time >= ?
+                ORDER BY publication_time ASC
+                """,
+                (dt_str,),
+            ).fetchall()
+            return [dict(row) for row in rows]
