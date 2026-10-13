@@ -222,3 +222,91 @@ def test_paper_executor_realistic_slippage_and_brokerage(db, safety_guard, risk_
     assert pos.realized_pnl == 545.0
     assert executor.daily_realized_pnl == 545.0
 
+
+def test_paper_executor_rejects_duplicate_order_id(paper_executor: PaperExecutor):
+    """Verify duplicate client_order_id submission is rejected immediately."""
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    cid = "custom_ord_123"
+
+    res1 = paper_executor.submit_order(
+        strategy_id="v2.2.0-RESEARCH-MOMENTUM-WICK",
+        symbol="NSE:NIFTY26O1317350CE",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=65,
+        price=100.0,
+        current_dt=dt_morning,
+        client_order_id=cid,
+    )
+    assert res1.success is True
+
+    # Resubmission with same client_order_id must be rejected
+    res2 = paper_executor.submit_order(
+        strategy_id="v2.2.0-RESEARCH-MOMENTUM-WICK",
+        symbol="NSE:NIFTY26O1317350CE",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=65,
+        price=100.0,
+        current_dt=dt_morning,
+        client_order_id=cid,
+    )
+    assert res2.success is False
+    assert res2.status.value == "REJECTED"
+    assert "Duplicate client_order_id" in res2.message
+
+
+def test_paper_executor_rejects_unmatched_exit(paper_executor: PaperExecutor):
+    """Verify EXIT intent with no matching open position is rejected without phantom fill."""
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+
+    res = paper_executor.submit_order(
+        strategy_id="v2.2.0-RESEARCH-MOMENTUM-WICK",
+        symbol="NSE:NIFTY26O1317350PE",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.EXIT,
+        quantity=65,
+        price=50.0,
+        current_dt=dt_morning,
+    )
+    assert res.success is False
+    assert res.status.value == "REJECTED"
+    assert "No open position found" in res.message
+
+
+def test_paper_executor_daily_counters_survive_restart(db, safety_guard, risk_governor, settings):
+    """Verify daily_realized_pnl and daily_trades_count survive process restart."""
+    exec1 = PaperExecutor.with_realistic_assumptions(db, safety_guard, risk_governor, settings)
+    dt_now = datetime.now(TZ).replace(hour=10, minute=0, second=0)
+
+    # Execute trade and close it
+    entry = exec1.submit_order(
+        strategy_id="v2.2.0-RESEARCH-MOMENTUM-WICK",
+        symbol="NSE:NIFTY26O1317350CE",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=65,
+        price=100.0,
+        current_dt=dt_now,
+    )
+    assert entry.success is True
+    exit_res = exec1.close_position(
+        position_id=entry.position_id,
+        exit_price=110.0,
+        current_dt=dt_now,
+        reason="TARGET_REACHED",
+    )
+    assert exit_res.success is True
+    assert exec1.daily_realized_pnl == 545.0
+    assert exec1.daily_trades_count == 2  # 1 entry + 1 exit
+
+    # Create new instance simulating process restart
+    exec2 = PaperExecutor.with_realistic_assumptions(db, safety_guard, risk_governor, settings)
+    assert exec2.daily_realized_pnl == 545.0
+    assert exec2.daily_trades_count == 2
+
+

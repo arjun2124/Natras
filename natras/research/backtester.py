@@ -46,6 +46,7 @@ class BacktestTrade:
     mfe_points: float
     mae_points: float
     exit_reason: str
+    is_real_option: bool = False
 
 
 @dataclass
@@ -66,6 +67,9 @@ class BacktestResult:
     max_drawdown: float
     max_consecutive_losses: int
     expectancy_per_trade: float
+    data_mode: str = "SPOT_PROXY_APPROXIMATION"
+    genuine_option_data: bool = False
+    disclaimer: str = ""
     trades: List[BacktestTrade] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -84,6 +88,25 @@ class Backtester:
     ) -> None:
         self.db_path = Path(db_path)
         self.risk_profile = risk_profile or get_default_risk_profile()
+
+    def _find_real_option_candle(self, spot_close: float, option_type: str, ts_iso: str) -> Optional[Dict[str, float]]:
+        """Attempt to find genuine traded option candle in database matching expiry and strike."""
+        if not self.db_path.exists():
+            return None
+        try:
+            strike = round(spot_close / 50.0) * 50
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT open, high, low, close, volume FROM candles "
+                "WHERE symbol LIKE ? AND symbol LIKE ? AND ts = ?",
+                (f"%{int(strike)}%", f"%{option_type}%", ts_iso),
+            ).fetchone()
+            conn.close()
+            if row:
+                return {"open": float(row[0]), "high": float(row[1]), "low": float(row[2]), "close": float(row[3]), "volume": float(row[4])}
+        except Exception:
+            pass
+        return None
 
     def run(
         self,
@@ -106,25 +129,35 @@ class Backtester:
         equity_curve: List[float] = [self.risk_profile.initial_paper_equity]
         peak_equity = self.risk_profile.initial_paper_equity
         max_drawdown = 0.0
+        used_genuine_options = True
 
         for candle in candles:
             c_time = candle.timestamp.astimezone(strat.tz).time()
 
-            # 1. If in active trade, update trailing stop using candle spot or simulated option move
+            # 1. If in active trade, update trailing stop
             if active_trade is not None and trailing_stop is not None:
-                # Option delta is approx ~0.50 of spot move
                 spot_entry = active_trade["spot_entry"]
                 direction = active_trade["direction"]
-                delta = 0.50
+                real_opt = self._find_real_option_candle(spot_entry, direction, candle.timestamp.isoformat())
 
-                if direction == "CE":
-                    best_option_move = (candle.high - spot_entry) * delta
-                    worst_option_move = (candle.low - spot_entry) * delta
-                    close_option_move = (candle.close - spot_entry) * delta
+                if real_opt:
+                    opt_entry = active_trade["quoted_entry"]
+                    best_option_move = real_opt["high"] - opt_entry
+                    worst_option_move = real_opt["low"] - opt_entry
+                    close_option_move = real_opt["close"] - opt_entry
+                    is_real = True
                 else:
-                    best_option_move = (spot_entry - candle.low) * delta
-                    worst_option_move = (spot_entry - candle.high) * delta
-                    close_option_move = (spot_entry - candle.close) * delta
+                    used_genuine_options = False
+                    delta = 0.50
+                    is_real = False
+                    if direction == "CE":
+                        best_option_move = (candle.high - spot_entry) * delta
+                        worst_option_move = (candle.low - spot_entry) * delta
+                        close_option_move = (candle.close - spot_entry) * delta
+                    else:
+                        best_option_move = (spot_entry - candle.low) * delta
+                        worst_option_move = (spot_entry - candle.high) * delta
+                        close_option_move = (spot_entry - candle.close) * delta
 
                 # Track MFE and MAE
                 if best_option_move > active_trade["mfe_points"]:
@@ -155,8 +188,8 @@ class Backtester:
                         symbol=symbol,
                         direction=direction,
                         entry_ts=active_trade["entry_ts"],
-                        entry_quoted=active_trade["quoted_entry"],
-                        entry_fill=active_trade["fill_entry"],
+                        entry_quoted=round(active_trade["quoted_entry"], 2),
+                        entry_fill=round(active_trade["fill_entry"], 2),
                         exit_ts=candle.timestamp.isoformat(),
                         exit_quoted=round(quoted_exit, 2),
                         exit_fill=round(fill_exit, 2),
@@ -168,6 +201,7 @@ class Backtester:
                         mfe_points=round(active_trade["mfe_points"], 2),
                         mae_points=round(active_trade["mae_points"], 2),
                         exit_reason=exit_reason,
+                        is_real_option=is_real,
                     )
                     trades.append(trade)
 
@@ -189,7 +223,14 @@ class Backtester:
                 if signals:
                     sig = signals[0]
                     direction = sig.metadata.get("instrument_type", "CE")
-                    quoted_entry = 100.0  # Normalized ATM premium baseline
+                    real_opt_entry = self._find_real_option_candle(candle.close, direction, candle.timestamp.isoformat())
+
+                    if real_opt_entry:
+                        quoted_entry = real_opt_entry["open"]
+                    else:
+                        used_genuine_options = False
+                        quoted_entry = 100.0  # Normalized baseline for spot proxy
+
                     fill_entry = quoted_entry + self.risk_profile.entry_slippage
 
                     trailing_stop = strat.create_trailing_stop()
@@ -235,6 +276,14 @@ class Backtester:
             candles[-1].timestamp.date().isoformat() if candles else "N/A",
         )
 
+        all_real = used_genuine_options and total_trades > 0
+        data_mode = "GENUINE_OPTION_DATA" if all_real else "SPOT_PROXY_APPROXIMATION"
+        disclaimer = "" if all_real else (
+            "Under NAT RAS 'No Fabricated Prices' Rule, spot-proxy results are approximate "
+            "research estimates (Delta=0.50, Baseline=100.0) and do NOT count as validated "
+            "genuine option premium fills."
+        )
+
         result = BacktestResult(
             experiment_id=experiment_id,
             parent_strategy=strat.strategy_id,
@@ -252,6 +301,9 @@ class Backtester:
             max_drawdown=round(max_drawdown, 2),
             max_consecutive_losses=max_streak,
             expectancy_per_trade=expectancy,
+            data_mode=data_mode,
+            genuine_option_data=all_real,
+            disclaimer=disclaimer,
             trades=trades,
         )
 

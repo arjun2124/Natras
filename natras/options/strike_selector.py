@@ -124,6 +124,36 @@ class OptionChain:
         return size
 
 
+def calculate_black_scholes_delta(
+    spot: float,
+    strike: float,
+    days_to_expiry: float,
+    option_type: str,
+    iv: float = 0.15,
+    r: float = 0.065,
+) -> float:
+    """Calculate standard Black-Scholes option delta.
+
+    Returns:
+    - CE: delta in [0.0, 1.0]
+    - PE: delta in [-1.0, 0.0]
+    """
+    if not math.isfinite(spot) or spot <= 0 or not math.isfinite(strike) or strike <= 0:
+        return 0.50 if option_type == "CE" else -0.50
+
+    t = max(days_to_expiry, 0.5) / 365.0
+    sigma = max(iv, 0.05)
+    sqrt_t = math.sqrt(t)
+
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
+    norm_cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+
+    if option_type == "CE":
+        return max(0.0, min(1.0, norm_cdf))
+    else:
+        return max(-1.0, min(0.0, norm_cdf - 1.0))
+
+
 @dataclass(frozen=True)
 class Selection:
     contract: OptionContract
@@ -132,6 +162,7 @@ class Selection:
     moneyness: Moneyness
     spot: float
     lot_size: int
+    estimated_delta: float = 0.50
 
 
 def select_contract(
@@ -180,7 +211,11 @@ def select_contract(
             f"{moneyness.label} {option_type} is outside the listed strikes "
             f"for {expiry}"
         )
-    contract = chain.contract(expiry, option_type, strikes[target])
+    chosen_strike = strikes[target]
+    contract = chain.contract(expiry, option_type, chosen_strike)
+    days_to_exp = max(0, (expiry - today).days)
+    delta = round(calculate_black_scholes_delta(spot, chosen_strike, days_to_exp, option_type), 4)
+
     return Selection(
         contract=contract,
         expiry=expiry,
@@ -188,6 +223,73 @@ def select_contract(
         moneyness=moneyness,
         spot=spot,
         lot_size=chain.lot_size(expiry),
+        estimated_delta=delta,
+    )
+
+
+def select_contract_by_delta(
+    chain: OptionChain,
+    *,
+    spot: float,
+    option_type: str,
+    target_delta: float = 0.45,
+    delta_tolerance: float = 0.15,
+    today: date,
+    min_days_to_expiry: int = 0,
+    max_atm_gap: float = 100.0,
+) -> Selection:
+    """Select the contract whose estimated Black-Scholes delta is closest to target_delta.
+
+    Enforces Master Draft Section 4 requirement: 'Target delta approximately 0.45'.
+    """
+    if option_type not in ("CE", "PE"):
+        raise StrikeSelectionError(f"option_type must be CE or PE, got {option_type!r}")
+    if not math.isfinite(spot) or spot <= 0:
+        raise StrikeSelectionError(f"invalid spot: {spot!r}")
+
+    expiry = chain.nearest_expiry(today, min_days_to_expiry)
+    strikes = chain.strikes(expiry, option_type)
+    if not strikes:
+        raise StrikeSelectionError(f"no {option_type} strikes for {expiry}")
+
+    days_to_exp = max(0, (expiry - today).days)
+    target_mag = abs(target_delta)
+
+    # Compute delta for each strike and find closest
+    candidates = []
+    for s in strikes:
+        d = calculate_black_scholes_delta(spot, s, days_to_exp, option_type)
+        diff = abs(abs(d) - target_mag)
+        candidates.append((diff, s, d))
+
+    candidates.sort(key=lambda x: (x[0], abs(x[1] - spot)))
+    best_diff, best_strike, best_delta = candidates[0]
+
+    if best_diff > delta_tolerance:
+        raise StrikeSelectionError(
+            f"No {option_type} strike within delta tolerance {delta_tolerance:.2f} of target {target_delta:.2f}. "
+            f"Best was strike {best_strike} with delta {best_delta:.4f} (diff {best_diff:.4f})."
+        )
+
+    atm = min(strikes, key=lambda s: (abs(s - spot), s))
+    atm_idx = strikes.index(atm)
+    chosen_idx = strikes.index(best_strike)
+    steps = abs(chosen_idx - atm_idx)
+    if steps == 0:
+        moneyness = Moneyness("ATM")
+    else:
+        is_itm = (chosen_idx < atm_idx) if option_type == "CE" else (chosen_idx > atm_idx)
+        moneyness = Moneyness("ITM" if is_itm else "OTM", steps)
+
+    contract = chain.contract(expiry, option_type, best_strike)
+    return Selection(
+        contract=contract,
+        expiry=expiry,
+        atm_strike=atm,
+        moneyness=moneyness,
+        spot=spot,
+        lot_size=chain.lot_size(expiry),
+        estimated_delta=round(best_delta, 4),
     )
 
 

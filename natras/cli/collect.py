@@ -122,6 +122,13 @@ def main() -> int:
                 except Exception as exc:
                     print(f'Market intelligence periodic settlement warning: {exc}', flush=True)
 
+            # Operate stepped trailing stop on genuine option premiums for open positions (docs/FINAL_PLAN.md step 6)
+            if paper_runtime:
+                try:
+                    paper_runtime.poll_and_update_open_positions(now)
+                except Exception as exc:
+                    print(f'Trailing stop poll warning: {exc}', flush=True)
+
             # Poll incoming Telegram commands from authorized chat
             if telegram_bot:
                 try:

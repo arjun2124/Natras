@@ -1,12 +1,15 @@
 """Paper trading execution engine with fail-closed safety and persistent state."""
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from natras.config.constants import (
+    MARKET_TIMEZONE_STR,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -23,6 +26,8 @@ from natras.db.models import (
 )
 from natras.risk.governor import RiskGovernor
 from natras.safety.guards import SafetyGuard
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,6 +73,33 @@ class PaperExecutor:
         self.risk_profile_id = risk_profile_id
         self.daily_realized_pnl = 0.0
         self.daily_trades_count = 0
+        self._recover_daily_counters()
+
+    def _recover_daily_counters(self) -> None:
+        """Recover daily_realized_pnl and daily_trades_count from SQLite for today's session."""
+        try:
+            today_str = datetime.now(ZoneInfo(MARKET_TIMEZONE_STR)).date().isoformat()
+            conn = self.db.get_connection()
+            row_pnl = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM positions "
+                "WHERE closed_at LIKE ?",
+                (f"{today_str}%",),
+            ).fetchone()
+            if row_pnl and row_pnl[0] is not None:
+                self.daily_realized_pnl = round(float(row_pnl[0]), 2)
+
+            row_trades = conn.execute(
+                "SELECT COUNT(*) FROM orders "
+                "WHERE status = 'FILLED' AND executed_at LIKE ?",
+                (f"{today_str}%",),
+            ).fetchone()
+            if row_trades and row_trades[0] is not None:
+                self.daily_trades_count = int(row_trades[0])
+
+            if not getattr(self.db, "_is_memory", False):
+                conn.close()
+        except Exception as exc:
+            logger.warning("Could not recover daily executor counters: %s", exc)
 
     @classmethod
     def with_realistic_assumptions(
@@ -110,6 +142,23 @@ class PaperExecutor:
         now_ist = self.safety_guard.to_ist(current_dt)
         now_iso = now_ist.isoformat()
 
+        # 0. Check for duplicate client_order_id submission
+        if self.db.get_order(cid) is not None:
+            msg = f"Duplicate client_order_id '{cid}' already exists."
+            self._journal_event(
+                event_type="ORDER_REJECTED",
+                strategy_id=strategy_id,
+                symbol=symbol,
+                payload={"client_order_id": cid, "reason": msg},
+                message=msg,
+            )
+            return ExecutionResult(
+                success=False,
+                order_id=cid,
+                status=OrderStatus.REJECTED,
+                message=msg,
+            )
+
         order = OrderRecord(
             client_order_id=cid,
             strategy_id=strategy_id,
@@ -144,8 +193,28 @@ class PaperExecutor:
                 message=order.reason,
             )
 
-        # 2. Risk Governor Verification
+        # 2. Risk Governor Verification & Matching Position Verification for EXIT
         open_positions = self.db.get_open_positions(strategy_id=strategy_id)
+        if intent_val == OrderIntent.EXIT.value:
+            matching_positions = [p for p in open_positions if p.symbol == symbol]
+            if not matching_positions:
+                order.status = OrderStatus.REJECTED.value
+                order.reason = f"No open position found for symbol {symbol} to exit."
+                self.db.save_order(order)
+                self._journal_event(
+                    event_type="ORDER_REJECTED",
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    payload={"client_order_id": cid, "reason": order.reason},
+                    message=f"Order {cid} rejected: {order.reason}",
+                )
+                return ExecutionResult(
+                    success=False,
+                    order_id=cid,
+                    status=OrderStatus.REJECTED,
+                    message=order.reason,
+                )
+
         passed, risk_msg = self.risk_governor.evaluate_order(
             order=order,
             open_positions=open_positions,

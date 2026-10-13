@@ -15,6 +15,7 @@ Implements Phase 3 of the NAT RAS Master Project Draft:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -39,6 +40,7 @@ from natras.options.strike_selector import (
     OptionChain,
     StrikeSelectionError,
     select_contract,
+    select_contract_by_delta,
 )
 from natras.options.symbol_master import OptionContract, load_nifty_options
 from natras.risk.governor import RiskGovernor
@@ -103,6 +105,48 @@ class PaperRuntime:
         # In-memory tracking of active option positions & trailing stops
         self.active_trackers: Dict[str, ActivePositionTracker] = {}
         self.chain = option_chain
+
+        # Phase 3 Requirement: Recover active open positions from database on startup
+        self.recover_open_positions()
+
+    def recover_open_positions(self) -> int:
+        """Recover active open positions from SQLite database across restarts."""
+        open_positions = self.db.get_open_positions()
+        recovered_count = 0
+        for pos in open_positions:
+            if pos.position_id in self.active_trackers:
+                continue
+
+            trailing = self.strategy.create_trailing_stop()
+            # Restore trailing stop state if current price indicates favorable movement
+            if pos.current_price is not None and pos.entry_price is not None:
+                current_pnl_pp = pos.current_price - pos.entry_price
+                if current_pnl_pp > 0:
+                    trailing.update(current_pnl_pp)
+
+            opened_dt = (
+                datetime.fromisoformat(pos.opened_at)
+                if pos.opened_at
+                else datetime.now(self.tz)
+            )
+
+            tracker = ActivePositionTracker(
+                position_id=pos.position_id,
+                symbol=pos.symbol,
+                option_type="CE" if "CE" in pos.symbol else "PE",
+                strike=0.0,
+                entry_price=pos.entry_price or 0.0,
+                quantity=pos.quantity or 0,
+                opened_at=opened_dt,
+                trailing_stop=trailing,
+                last_known_price=pos.current_price or pos.entry_price or 0.0,
+            )
+            self.active_trackers[pos.position_id] = tracker
+            recovered_count += 1
+
+        if recovered_count > 0:
+            logger.info("Successfully recovered %d active position trackers on restart.", recovered_count)
+        return recovered_count
 
     def load_option_chain_from_master(self, master_path: Optional[str] = None) -> None:
         """Load option chain from downloaded FYERS NSE_FO symbol master."""
@@ -191,13 +235,22 @@ class PaperRuntime:
         today = now_ist.date()
 
         try:
-            selection = select_contract(
-                chain=self.chain,
-                spot=candle.close,
-                option_type=option_type,
-                moneyness=Moneyness.parse(self.risk_profile.preferred_moneyness),
-                today=today,
-            )
+            if getattr(self.risk_profile, "target_delta", None) is not None:
+                selection = select_contract_by_delta(
+                    chain=self.chain,
+                    spot=candle.close,
+                    option_type=option_type,
+                    target_delta=self.risk_profile.target_delta,
+                    today=today,
+                )
+            else:
+                selection = select_contract(
+                    chain=self.chain,
+                    spot=candle.close,
+                    option_type=option_type,
+                    moneyness=Moneyness.parse(self.risk_profile.preferred_moneyness),
+                    today=today,
+                )
         except StrikeSelectionError as exc:
             logger.error("Option strike selection failed: %s", exc)
             self.telegram.send_message(f"❌ *OPTION SELECTION FAILED*\n• Error: {exc}")
@@ -206,8 +259,8 @@ class PaperRuntime:
         contract_symbol = selection.contract.symbol
         lot_size = selection.lot_size
 
-        # Fetch and validate live quote for option contract
-        quoted_price = self._get_and_validate_option_quote(contract_symbol)
+        # Fetch and validate live quote for option contract (freshness & finiteness)
+        quoted_price = self._get_and_validate_option_quote(contract_symbol, current_dt=now_ist)
         if quoted_price is None:
             logger.warning("Order aborted: Option quote unavailable or failed validation for %s", contract_symbol)
             return None
@@ -255,8 +308,12 @@ class PaperRuntime:
 
         return res
 
-    def _get_and_validate_option_quote(self, symbol: str) -> Optional[float]:
-        """Fetch quote and validate against spread and liquidity requirements."""
+    def _get_and_validate_option_quote(
+        self,
+        symbol: str,
+        current_dt: Optional[datetime] = None,
+    ) -> Optional[float]:
+        """Fetch quote and validate against spread, liquidity, finiteness, and staleness requirements."""
         if self.quote_fetcher is None:
             logger.warning("No quote fetcher configured; cannot obtain real option quote.")
             return None
@@ -267,7 +324,7 @@ class PaperRuntime:
             if not q or not isinstance(q, dict):
                 return None
 
-            valid, reason = self.risk_profile.validate_option_quote(q)
+            valid, reason = self.risk_profile.validate_option_quote(q, current_dt=current_dt)
             if not valid:
                 logger.warning("Quote rejected by risk profile for %s: %s", symbol, reason)
                 self.telegram.send_message(
@@ -279,10 +336,62 @@ class PaperRuntime:
 
             # Quoted entry price is ask price for BUY order
             ask = float(q.get("ask") or q.get("a_price") or q.get("ltp") or q.get("close", 0))
+            if not math.isfinite(ask) or ask <= 0:
+                logger.warning("Invalid non-finite or non-positive ask price for %s: %s", symbol, ask)
+                return None
             return ask
         except Exception as exc:
             logger.error("Failed to fetch quote for %s: %s", symbol, exc)
             return None
+
+    def poll_and_update_open_positions(
+        self,
+        current_dt: Optional[datetime] = None,
+    ) -> List[ExecutionResult]:
+        """Poll live option quotes for open positions and operate stepped trailing stops.
+
+        Fulfills Step 6 of docs/FINAL_PLAN.md:
+        'Monitor genuine option premiums to operate the existing stepped trailing stop.'
+        """
+        if not self.active_trackers:
+            return []
+
+        now_ist = self.safety_guard.to_ist(current_dt)
+
+        # Check EOD square-off cutoff (15:00 / 15:15 IST)
+        if self.strategy.is_eod_square_off_time(now_ist):
+            return self.square_off_all_positions(now_ist, reason="EOD_SQUARE_OFF_1500_IST")
+
+        if self.quote_fetcher is None:
+            return []
+
+        symbols = list(set(t.symbol for t in self.active_trackers.values()))
+        results: List[ExecutionResult] = []
+        try:
+            quotes = self.quote_fetcher(symbols)
+            if not quotes or not isinstance(quotes, dict):
+                return []
+
+            for sym in symbols:
+                q = quotes.get(sym)
+                if not q or not isinstance(q, dict):
+                    continue
+
+                valid, reason = self.risk_profile.validate_option_quote(q, current_dt=now_ist)
+                if not valid:
+                    logger.warning("Live quote for %s failed validation: %s", sym, reason)
+                    continue
+
+                ltp = float(q.get("ltp") or q.get("close") or q.get("bid", 0.0))
+                if not math.isfinite(ltp) or ltp <= 0:
+                    continue
+
+                res_list = self.update_positions_on_option_price(sym, ltp, now_ist)
+                results.extend(res_list)
+        except Exception as exc:
+            logger.error("Error polling open option position quotes: %s", exc)
+
+        return results
 
     def update_positions_on_option_price(
         self,
@@ -294,6 +403,10 @@ class PaperRuntime:
 
         Ratchets the stepped trailing stop upward and checks for stop-out breaches.
         """
+        if not math.isfinite(current_price) or current_price <= 0:
+            logger.warning("Rejected non-finite/non-positive option price for %s: %s", symbol, current_price)
+            return []
+
         results: List[ExecutionResult] = []
         now_ist = self.safety_guard.to_ist(current_dt)
 
@@ -361,7 +474,12 @@ class PaperRuntime:
         open_positions = self.db.get_open_positions()
         for pos in open_positions:
             tracker = self.active_trackers.get(pos.position_id)
-            exit_price = tracker.last_known_price if tracker else pos.current_price
+            candidate = tracker.last_known_price if tracker else pos.current_price
+            if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                exit_price = candidate
+            else:
+                exit_price = pos.entry_price or 100.0
+
             res = self.executor.close_position(
                 position_id=pos.position_id,
                 exit_price=exit_price,

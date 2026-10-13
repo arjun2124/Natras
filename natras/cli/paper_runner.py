@@ -136,6 +136,8 @@ def main() -> int:
                 break
             # Close completed candle bucket if on time
             feed.close_completed(now_ist)
+            # Operate stepped trailing stop on genuine option premiums for open positions
+            runtime.poll_and_update_open_positions(now_ist)
             # Poll Telegram commands
             telegram.poll_once()
             time.sleep(2)
