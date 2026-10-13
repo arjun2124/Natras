@@ -1,6 +1,7 @@
-'''Auto FYERS login. Run: python -m natras.cli.fyers_auto_login
+'''FYERS login. Run: python -m natras.cli.fyers_auto_login
 
-Opens the FYERS login page and catches the redirect on the local redirect-URI port.
+http redirect URI  -> catches the redirect automatically on the local port.
+https redirect URI -> the browser shows a connection error page; paste the address-bar URL.
 '''
 import threading
 import webbrowser
@@ -8,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 from natras.adapters.fyers_auth import FyersAuthenticator, FyersCredentials, parse_auth_code
+from natras.cli._env import load_env
 
 
 def wait_for_redirect(port: int, timeout: int = 300) -> str:
@@ -38,13 +40,17 @@ _wait_for_redirect = wait_for_redirect
 
 
 def main() -> int:
+    load_env()
     creds = FyersCredentials.from_env()
-    port = urlparse(creds.redirect_uri).port or 5000
+    parsed = urlparse(creds.redirect_uri)
     auth = FyersAuthenticator(creds)
     url = auth.get_login_url()
     print('Opening FYERS login in your browser...')
     webbrowser.open(url)
-    redirected = wait_for_redirect(port)
+    if parsed.scheme == 'http':
+        redirected = wait_for_redirect(parsed.port or 5000)
+    else:
+        redirected = input('After login, paste the full URL from the address bar: ').strip()
     auth.exchange_auth_code(parse_auth_code(redirected))
     print('Token saved (value not shown).')
     return 0

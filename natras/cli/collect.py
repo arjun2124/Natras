@@ -11,6 +11,7 @@ from pathlib import Path
 
 from natras.adapters.fyers_auth import FyersAuthenticator, FyersCredentials
 from natras.adapters.fyers_live import FyersFeed, FyersLiveAdapter
+from natras.cli._env import load_env
 from natras.data.session import IST
 
 DB_PATH = Path('data') / 'market.db'
@@ -32,6 +33,7 @@ def _save(db, candle, source):
 
 
 def main() -> int:
+    load_env()
     symbols = sys.argv[1:] or DEFAULT_SYMBOLS
     creds = FyersCredentials.from_env()
     token = FyersAuthenticator(creds).get_access_token()

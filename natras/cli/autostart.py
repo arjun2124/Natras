@@ -2,11 +2,18 @@
 
 Triggered when the laptop connects to Wi-Fi (see scripts/register_autostart.ps1).
 Flow: check window -> wait for internet -> if FYERS token is stale, send the login link
-to Telegram and catch the redirect -> run the data collector -> report to Telegram.
+to Telegram and complete login -> run the data collector -> report to Telegram.
+
+Login completion:
+- http redirect URI  : local server catches the redirect (open the link on this laptop).
+- https redirect URI : after login the browser shows a connection error page; copy the
+  full address-bar URL and send it to the Telegram bot. Works from phone or laptop.
+
 Data only. No orders. Secrets are never sent to Telegram or logged.
 '''
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +31,7 @@ from natras.adapters.fyers_auth import (
     FyersCredentials,
     parse_auth_code,
 )
+from natras.cli._env import load_env
 from natras.cli.fyers_auto_login import wait_for_redirect
 from natras.data.session import IST
 
@@ -39,22 +47,11 @@ LOCK_FRESH_SECONDS = 90
 log = logging.getLogger('natras.autostart')
 
 
-def load_env(path: Path = Path('.env')) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding='utf-8').splitlines():
-        line = line.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
-        key, _, value = line.partition('=')
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
 class Notifier:
     def __init__(self) -> None:
         self._token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
         self._chat = os.environ.get('TELEGRAM_AUTHORIZED_USER_ID') or os.environ.get('TELEGRAM_CHAT_ID', '')
-        self.enabled = bool(self._token and self._chat) and 'your_' not in self._token
+        self.enabled = bool(self._token and self._chat) and 'your_' not in self._token and 'your_' not in self._chat
 
     def send(self, text: str) -> bool:
         log.info('TG: %s', text.splitlines()[0][:120])
@@ -71,6 +68,39 @@ class Notifier:
         except requests.RequestException as exc:
             log.warning('Telegram send failed: %s', type(exc).__name__)
             return False
+
+    def wait_for_message(self, match, timeout: int):
+        '''Return the first text from the authorized chat that satisfies match(text).'''
+        if not self.enabled:
+            return None
+        base = f'https://api.telegram.org/bot{self._token}/getUpdates'
+        offset = None
+        try:
+            flush = requests.get(base, params={'offset': -1, 'timeout': 0}, timeout=15).json()
+            items = flush.get('result', [])
+            if items:
+                offset = items[-1]['update_id'] + 1
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+        end = time.time() + timeout
+        while time.time() < end:
+            params = {'timeout': 20}
+            if offset is not None:
+                params['offset'] = offset
+            try:
+                data = requests.get(base, params=params, timeout=30).json()
+            except (requests.RequestException, ValueError):
+                time.sleep(3)
+                continue
+            for upd in data.get('result', []):
+                offset = upd['update_id'] + 1
+                msg = upd.get('message') or {}
+                if str(msg.get('chat', {}).get('id')) != str(self._chat):
+                    continue
+                text = msg.get('text', '')
+                if match(text):
+                    return text
+        return None
 
 
 def in_window(now: datetime) -> bool:
@@ -102,6 +132,11 @@ def wait_for_internet(max_seconds: int = 180) -> bool:
     return False
 
 
+def _extract_url(text: str) -> str:
+    found = re.search(r'https?://\S+', text)
+    return found.group(0) if found else text.strip()
+
+
 def ensure_fyers_token(notifier: Notifier) -> bool:
     creds = FyersCredentials.from_env()
     auth = FyersAuthenticator(creds)
@@ -112,18 +147,32 @@ def ensure_fyers_token(notifier: Notifier) -> bool:
     except FyersAuthError:
         pass
 
-    port = urlparse(creds.redirect_uri).port or 5000
+    parsed = urlparse(creds.redirect_uri)
     url = auth.get_login_url()
-    notifier.send(
-        'NAT RAS: FYERS login needed. Open this link ON THIS LAPTOP within 15 minutes '
-        '(the redirect returns to 127.0.0.1):\n' + url
-    )
     try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    try:
-        redirected = wait_for_redirect(port, timeout=LOGIN_TIMEOUT_SECONDS)
+        if parsed.scheme == 'http':
+            notifier.send(
+                'NAT RAS: FYERS login needed. Open this link ON THIS LAPTOP within 15 minutes:\n' + url
+            )
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            redirected = wait_for_redirect(parsed.port or 5000, timeout=LOGIN_TIMEOUT_SECONDS)
+        else:
+            notifier.send(
+                'NAT RAS: FYERS login needed. 1) Open this link and log in:\n' + url +
+                '\n2) The browser will then show a connection error page. That is expected.\n'
+                '3) Copy the FULL address-bar URL (it contains auth_code=) and send it here.'
+            )
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            text = notifier.wait_for_message(lambda t: 'auth_code=' in t, LOGIN_TIMEOUT_SECONDS)
+            if text is None:
+                raise TimeoutError('No login URL received.')
+            redirected = _extract_url(text)
         auth.exchange_auth_code(parse_auth_code(redirected))
     except TimeoutError:
         notifier.send('NAT RAS: FYERS login timed out. Collection NOT started.')
@@ -139,8 +188,7 @@ def run_collector(notifier: Notifier) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     restarts = 0
     while True:
-        now = datetime.now(IST)
-        if not in_window(now):
+        if not in_window(datetime.now(IST)):
             break
         with open(LOG_PATH.parent / 'collector.log', 'a', encoding='utf-8') as out:
             proc = subprocess.Popen(
@@ -163,7 +211,9 @@ def end_of_day_summary(notifier: Notifier) -> None:
     try:
         db = sqlite3.connect(DB_PATH)
         today = datetime.now(IST).date().isoformat()
-        n = db.execute("SELECT COUNT(*) FROM candles WHERE ts LIKE ? AND source='fyers_live'", (today + '%',)).fetchone()[0]
+        n = db.execute(
+            "SELECT COUNT(*) FROM candles WHERE ts LIKE ? AND source='fyers_live'", (today + '%',)
+        ).fetchone()[0]
         db.close()
         notifier.send(f'NAT RAS: collection finished. {n} live 5-minute candles saved today.')
     except Exception as exc:
@@ -177,8 +227,7 @@ def main() -> int:
         filename=LOG_PATH, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s'
     )
     notifier = Notifier()
-    now = datetime.now(IST)
-    if not in_window(now):
+    if not in_window(datetime.now(IST)):
         log.info('Outside weekday collection window; exiting.')
         return 0
     if lock_active():
