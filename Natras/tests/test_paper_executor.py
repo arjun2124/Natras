@@ -1,0 +1,182 @@
+"""Unit tests for paper execution engine, safety enforcement, and position management."""
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import pytest
+
+from natras.config.constants import (
+    MARKET_TIMEZONE_STR,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionStatus,
+)
+from natras.config.settings import LiveTradingProhibitedError, Settings
+from natras.execution.paper_executor import PaperExecutor
+
+TZ = ZoneInfo(MARKET_TIMEZONE_STR)
+
+
+def test_paper_executor_successful_entry(paper_executor: PaperExecutor):
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    res = paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=50,
+        price=24500.0,
+        current_dt=dt_morning,
+        stop_loss=24450.0,
+        take_profit=24600.0,
+    )
+    assert res.success is True
+    assert res.status == OrderStatus.FILLED
+    assert res.fill_price == 24500.0
+    assert res.position_id is not None
+
+    # Check database persistence
+    open_positions = paper_executor.db.get_open_positions()
+    assert len(open_positions) == 1
+    pos = open_positions[0]
+    assert pos.symbol == "NIFTY"
+    assert pos.entry_price == 24500.0
+    assert pos.stop_loss == 24450.0
+    assert pos.take_profit == 24600.0
+
+
+def test_paper_executor_blocks_entry_at_1500_ist(paper_executor: PaperExecutor):
+    dt_cutoff = datetime(2026, 10, 14, 15, 0, 0, tzinfo=TZ)
+    res = paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=50,
+        price=24500.0,
+        current_dt=dt_cutoff,
+    )
+    assert res.success is False
+    assert res.status == OrderStatus.REJECTED
+    assert "Safety Violation" in res.message
+    assert "15:00 IST cutoff" in res.message
+
+    # Ensure no position opened
+    assert len(paper_executor.db.get_open_positions()) == 0
+
+
+def test_paper_executor_allows_position_exit_after_1500_ist(paper_executor: PaperExecutor):
+    # 1. Open in morning
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    entry_res = paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=50,
+        price=24500.0,
+        current_dt=dt_morning,
+    )
+    assert entry_res.success is True
+    pos_id = entry_res.position_id
+
+    # 2. Close position at 15:15 IST (allowed)
+    dt_after = datetime(2026, 10, 14, 15, 15, 0, tzinfo=TZ)
+    exit_res = paper_executor.close_position(
+        position_id=pos_id,
+        exit_price=24550.0,
+        current_dt=dt_after,
+        reason="EOD_MANAGEMENT",
+    )
+    assert exit_res.success is True
+    assert exit_res.status == OrderStatus.FILLED
+
+    # Check realized PnL: (24550 - 24500) * 50 = +2500
+    pos = paper_executor.db.get_position(pos_id)
+    assert pos.status == PositionStatus.CLOSED.value
+    assert pos.realized_pnl == 2500.0
+    assert paper_executor.daily_realized_pnl == 2500.0
+
+
+def test_paper_executor_short_position_pnl(paper_executor: PaperExecutor):
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    entry_res = paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=50,
+        price=24500.0,
+        current_dt=dt_morning,
+    )
+    pos_id = entry_res.position_id
+
+    # Close with profit: entry 24500, exit 24400 -> profit = (24500 - 24400) * 50 = 5000
+    exit_res = paper_executor.close_position(
+        position_id=pos_id,
+        exit_price=24400.0,
+        current_dt=dt_morning,
+        reason="TARGET_MET",
+    )
+    assert exit_res.success is True
+    pos = paper_executor.db.get_position(pos_id)
+    assert pos.realized_pnl == 5000.0
+
+
+def test_paper_executor_stop_loss_triggered_on_candle(paper_executor: PaperExecutor):
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    entry_res = paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=20,
+        price=24500.0,
+        stop_loss=24400.0,
+        take_profit=24700.0,
+        current_dt=dt_morning,
+    )
+    pos_id = entry_res.position_id
+
+    # Candle dips to 24390 (below SL 24400)
+    dt_candle = datetime(2026, 10, 14, 10, 5, 0, tzinfo=TZ)
+    results = paper_executor.update_positions_on_candle(
+        symbol="NIFTY",
+        high=24510.0,
+        low=24390.0,
+        close=24410.0,
+        current_dt=dt_candle,
+    )
+    assert len(results) == 1
+    assert results[0].success is True
+    assert results[0].position_id == pos_id
+
+    pos = paper_executor.db.get_position(pos_id)
+    assert pos.status == PositionStatus.CLOSED.value
+    # PnL: (24400 - 24500) * 20 = -2000
+    assert pos.realized_pnl == -2000.0
+
+
+def test_paper_executor_journal_persisted(paper_executor: PaperExecutor):
+    dt_morning = datetime(2026, 10, 14, 10, 0, 0, tzinfo=TZ)
+    paper_executor.submit_order(
+        strategy_id="v2.2.0-baseline",
+        symbol="NIFTY",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        intent=OrderIntent.ENTRY,
+        quantity=10,
+        price=24500.0,
+        current_dt=dt_morning,
+    )
+    entries = paper_executor.db.get_journal_entries()
+    assert len(entries) >= 2  # POSITION_OPENED, ORDER_FILLED
+    events = [e.event_type for e in entries]
+    assert "POSITION_OPENED" in events
+    assert "ORDER_FILLED" in events
