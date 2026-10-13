@@ -57,26 +57,47 @@ def main() -> int:
         except Exception as exc:
             print(f'Backfill failed for {s}: {type(exc).__name__}: {exc}', flush=True)
 
-    def on_candle(c):
-        with lock:
-            _save(db, c, 'fyers_live')
-        print(f'{c.symbol} {c.timestamp:%H:%M} C={c.close}', flush=True)
-
-    feed = FyersFeed(creds.app_id, token, symbols, on_candle)
-    threading.Thread(target=feed.start, daemon=True).start()
-
-    # Initialize Market Intelligence settlement engine
+    # Initialize Market Intelligence settlement engine and Paper Trading Runtime
     try:
         from natras.db.database import DatabaseManager
         from natras.market_intelligence.orchestrator import MarketIntelligenceOrchestrator
+        from natras.adapters.telegram_live import TelegramLiveBot
+        from natras.execution.paper_runtime import PaperRuntime
+
         natras_db = DatabaseManager()
         orch = MarketIntelligenceOrchestrator(db_manager=natras_db)
         print('Settling initial market intelligence & news snapshot...', flush=True)
         orch.poll_and_settle(natras_db)
+
+        telegram_bot = TelegramLiveBot(db_manager=natras_db)
+        paper_runtime = PaperRuntime(
+            db=natras_db,
+            telegram_bot=telegram_bot,
+            quote_fetcher=adapter.fetch_quotes,
+        )
+        paper_runtime.load_option_chain_from_master()
+        print('Paper trading runtime and Telegram command listener active.', flush=True)
     except Exception as exc:
-        print(f'Warning: Market intelligence initialization skipped: {exc}', flush=True)
+        print(f'Warning: Runtime extensions skipped: {exc}', flush=True)
         orch = None
         natras_db = None
+        telegram_bot = None
+        paper_runtime = None
+
+    def on_candle(c):
+        with lock:
+            _save(db, c, 'fyers_live')
+        print(f'{c.symbol} {c.timestamp:%H:%M} C={c.close}', flush=True)
+        if paper_runtime and 'NIFTY50' in c.symbol:
+            try:
+                results = paper_runtime.on_spot_candle(c)
+                for res in results:
+                    print(f'Paper Order: {res.order_id} fill={res.fill_price}', flush=True)
+            except Exception as exc:
+                print(f'Paper execution error: {exc}', flush=True)
+
+    feed = FyersFeed(creds.app_id, token, symbols, on_candle)
+    threading.Thread(target=feed.start, daemon=True).start()
 
     last_health = 0.0
     last_intel = time.time()
@@ -101,9 +122,21 @@ def main() -> int:
                 except Exception as exc:
                     print(f'Market intelligence periodic settlement warning: {exc}', flush=True)
 
+            # Poll incoming Telegram commands from authorized chat
+            if telegram_bot:
+                try:
+                    telegram_bot.poll_once()
+                except Exception:
+                    pass
+
             time.sleep(2)
     finally:
         feed.stop()
+        if paper_runtime:
+            try:
+                paper_runtime.square_off_all_positions(reason="COLLECTOR_STOPPED")
+            except Exception:
+                pass
         db.close()
         # Final EOD settlement
         if orch:

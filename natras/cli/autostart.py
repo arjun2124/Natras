@@ -122,13 +122,16 @@ def touch_lock() -> None:
 
 
 def wait_for_internet(max_seconds: int = 180) -> bool:
+    print("Checking internet connectivity...", flush=True)
     end = time.time() + max_seconds
     while time.time() < end:
         try:
             requests.get('https://api.telegram.org', timeout=5)
+            print("Internet connected.", flush=True)
             return True
         except requests.RequestException:
             time.sleep(5)
+    print("Internet not reachable.", flush=True)
     return False
 
 
@@ -142,7 +145,8 @@ def ensure_fyers_token(notifier: Notifier) -> bool:
     auth = FyersAuthenticator(creds)
     try:
         auth.get_access_token()
-        notifier.send('NAT RAS: FYERS token is valid. Starting data collection.')
+        print("FYERS token is valid.", flush=True)
+        notifier.send('NAT RAS: FYERS token is valid. Starting data collection & paper engine.')
         return True
     except FyersAuthError:
         pass
@@ -150,6 +154,7 @@ def ensure_fyers_token(notifier: Notifier) -> bool:
     parsed = urlparse(creds.redirect_uri)
     url = auth.get_login_url()
     try:
+        print(f"FYERS login needed. Opening login URL:\n{url}", flush=True)
         if parsed.scheme == 'http':
             notifier.send(
                 'NAT RAS: FYERS login needed. Open this link ON THIS LAPTOP within 15 minutes:\n' + url
@@ -180,15 +185,16 @@ def ensure_fyers_token(notifier: Notifier) -> bool:
     except FyersAuthError as exc:
         notifier.send(f'NAT RAS: FYERS login failed: {exc}')
         return False
-    notifier.send('NAT RAS: FYERS login successful. Starting data collection.')
+    notifier.send('NAT RAS: FYERS login successful. Starting data collection & paper engine.')
     return True
 
 
-def run_collector(notifier: Notifier) -> None:
+def run_collector(notifier: Notifier, force: bool = False) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     restarts = 0
+    print("Launching collector, paper engine & market intelligence...", flush=True)
     while True:
-        if not in_window(datetime.now(IST)):
+        if not force and not in_window(datetime.now(IST)):
             break
         with open(LOG_PATH.parent / 'collector.log', 'a', encoding='utf-8') as out:
             proc = subprocess.Popen(
@@ -215,7 +221,7 @@ def end_of_day_summary(notifier: Notifier) -> None:
             "SELECT COUNT(*) FROM candles WHERE ts LIKE ? AND source='fyers_live'", (today + '%',)
         ).fetchone()[0]
         db.close()
-        notifier.send(f'NAT RAS: collection finished. {n} live 5-minute candles saved today.')
+        notifier.send(f'NAT RAS: session finished. {n} live 5-minute candles saved today.')
     except Exception as exc:
         notifier.send(f'NAT RAS: collection finished; summary unavailable ({type(exc).__name__}).')
 
@@ -224,14 +230,26 @@ def main() -> int:
     load_env()
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        filename=LOG_PATH, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s'
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_PATH, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
     notifier = Notifier()
-    if not in_window(datetime.now(IST)):
-        log.info('Outside weekday collection window; exiting.')
+    force = '--force' in sys.argv
+    now = datetime.now(IST)
+    if not force and not in_window(now):
+        msg = f"[{now:%H:%M:%S}] Outside weekday collection window (07:00 - 15:30 IST)."
+        log.info(msg)
+        print(msg)
+        print("To launch immediately outside the trading window (e.g. testing), run with: --force")
         return 0
     if lock_active():
-        log.info('Another autostart instance is active; exiting.')
+        msg = 'Another autostart instance is active; exiting.'
+        log.info(msg)
+        print(msg)
         return 0
     touch_lock()
     if not wait_for_internet():
@@ -240,7 +258,7 @@ def main() -> int:
     notifier.send('NAT RAS: laptop online. Checking FYERS session.')
     if not ensure_fyers_token(notifier):
         return 1
-    run_collector(notifier)
+    run_collector(notifier, force=force)
     end_of_day_summary(notifier)
     try:
         LOCK_PATH.unlink()
