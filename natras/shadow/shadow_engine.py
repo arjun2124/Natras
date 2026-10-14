@@ -63,6 +63,7 @@ class ShadowCandidate:
     profit_factor: float = 0.0
     recent_session_dates: List[str] = field(default_factory=list)
     trades: List[ShadowTrade] = field(default_factory=list)
+    active_position: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -71,10 +72,26 @@ class ShadowCandidate:
 class ShadowEngine:
     """Manages virtual execution of shadow strategy candidates."""
 
+    DEFAULT_VARIANTS = [
+        {
+            "name": "Experimental_Aggressive_Body_0.40",
+            "param_overrides": {"min_body_ratio": 0.40},
+        },
+        {
+            "name": "Experimental_High_Conviction_0.60",
+            "param_overrides": {"min_body_ratio": 0.60},
+        },
+        {
+            "name": "Experimental_Tight_Trail_6_2",
+            "param_overrides": {"trail_trigger_pp": 6.0, "trail_gap_pp": 2.0},
+        },
+    ]
+
     def __init__(
         self,
         risk_profile: Optional[StrategyRiskProfile] = None,
         store_path: Path | str = SHADOW_STORE_PATH,
+        auto_seed: bool = True,
     ) -> None:
         self.risk_profile = risk_profile or get_default_risk_profile()
         self.store_path = Path(store_path)
@@ -82,6 +99,62 @@ class ShadowEngine:
         self.active_strategies: Dict[str, MomentumWickStrategy] = {}
         self.active_positions: Dict[str, Dict[str, Any]] = {}
         self._load()
+        if auto_seed and not self.candidates:
+            self.ensure_default_candidates()
+
+    def ensure_default_candidates(self) -> List[ShadowCandidate]:
+        """Ensure standard research variants are registered if none exist."""
+        if self.candidates:
+            return list(self.candidates.values())
+        added = []
+        for v in self.DEFAULT_VARIANTS:
+            cand = self.register_variant(
+                name=v["name"],
+                param_overrides=v["param_overrides"],
+            )
+            added.append(cand)
+        return added
+
+    def warmup_from_db(
+        self,
+        db_path: Path | str = Path("data") / "market.db",
+        limit: int = 200,
+    ) -> int:
+        """Warm up strategy candle history from local sqlite database."""
+        p = Path(db_path)
+        if not p.exists():
+            return 0
+        try:
+            import sqlite3
+            from natras.data.candle_engine import validate_candle
+
+            conn = sqlite3.connect(p)
+            rows = conn.execute(
+                "SELECT symbol, ts, open, high, low, close, volume FROM candles "
+                "WHERE symbol LIKE '%NIFTY50%' ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            if not rows:
+                return 0
+            candles = []
+            for r in reversed(rows):
+                sym, ts_str, o, h, l, c, v = r
+                ts = datetime.fromisoformat(ts_str)
+                candles.append(validate_candle(sym, ts, o, h, l, c, v))
+            count = 0
+            for strat in self.active_strategies.values():
+                strat.history = list(candles)
+                count = len(candles)
+            logger.info(
+                "Warmed up %d shadow strategies with %d historical candles.",
+                len(self.active_strategies),
+                count,
+            )
+            return count
+        except Exception as exc:
+            logger.warning("Failed to warmup shadow engine from db: %s", exc)
+            return 0
 
     def register_variant(
         self,
@@ -131,6 +204,10 @@ class ShadowEngine:
                 worst_move = (candle.low - spot_entry) * delta if direction == "CE" else (spot_entry - candle.high) * delta
 
                 ts.update(best_move)
+                if candidate.active_position:
+                    candidate.active_position["peak_fav_pp"] = ts.peak_fav_pp
+                    candidate.active_position["current_stop_pp"] = ts.current_stop_pp
+
                 is_stopped = ts.is_stopped_out(worst_move)
                 is_eod = strat.is_eod_square_off_time(candle.timestamp)
 
@@ -166,9 +243,18 @@ class ShadowEngine:
                     candidate.gross_pnl = round(candidate.gross_pnl + gross, 2)
                     candidate.net_pnl = round(candidate.net_pnl + net, 2)
 
+                    candidate.active_position = None
                     del self.active_positions[cid]
                     self._evaluate_lifecycle(candidate)
                     self._save()
+                    logger.info(
+                        "Shadow candidate %s (%s) closed virtual %s trade: Net PnL=%.2f (%s)",
+                        cid,
+                        candidate.name,
+                        direction,
+                        net,
+                        exit_reason,
+                    )
                     continue
 
             # 2. Check for new virtual signal
@@ -179,8 +265,9 @@ class ShadowEngine:
                     direction = sig.metadata.get("instrument_type", "CE")
                     quoted_entry = 100.0
                     fill_entry = quoted_entry + self.risk_profile.entry_slippage
+                    ts = strat.create_trailing_stop()
 
-                    self.active_positions[cid] = {
+                    pos = {
                         "trade_id": f"st_{uuid.uuid4().hex[:8]}",
                         "direction": direction,
                         "spot_entry": candle.close,
@@ -188,8 +275,28 @@ class ShadowEngine:
                         "fill_entry": fill_entry,
                         "entry_ts": candle.timestamp.isoformat(),
                         "quantity": self.risk_profile.lot_size_units,
-                        "trailing_stop": strat.create_trailing_stop(),
+                        "trailing_stop": ts,
                     }
+                    self.active_positions[cid] = pos
+                    candidate.active_position = {
+                        "trade_id": pos["trade_id"],
+                        "direction": direction,
+                        "spot_entry": candle.close,
+                        "quoted_entry": quoted_entry,
+                        "fill_entry": fill_entry,
+                        "entry_ts": pos["entry_ts"],
+                        "quantity": pos["quantity"],
+                        "peak_fav_pp": ts.peak_fav_pp,
+                        "current_stop_pp": ts.current_stop_pp,
+                    }
+                    self._save()
+                    logger.info(
+                        "Shadow candidate %s (%s) opened virtual %s trade at spot=%.2f",
+                        cid,
+                        candidate.name,
+                        direction,
+                        candle.close,
+                    )
 
     def _evaluate_lifecycle(self, candidate: ShadowCandidate) -> None:
         """Evaluate candidate against 3-5 sessions removal or promotion rule."""
@@ -243,8 +350,19 @@ class ShadowEngine:
                 cand = ShadowCandidate(**d)
                 self.candidates[cid] = cand
                 if cand.status == "SHADOW_LIVE":
-                    self.active_strategies[cid] = MomentumWickStrategy(
+                    strat = MomentumWickStrategy(
                         strategy_id=cid, **cand.parameters
                     )
+                    self.active_strategies[cid] = strat
+                    if cand.active_position:
+                        ts = strat.create_trailing_stop()
+                        ts.peak_fav_pp = cand.active_position.get("peak_fav_pp", 0.0)
+                        ts.current_stop_pp = cand.active_position.get(
+                            "current_stop_pp", -abs(strat.initial_stop_pp)
+                        )
+                        self.active_positions[cid] = {
+                            **cand.active_position,
+                            "trailing_stop": ts,
+                        }
         except Exception as exc:
             logger.warning("Could not load shadow registry: %s", exc)

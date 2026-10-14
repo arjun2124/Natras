@@ -26,6 +26,19 @@ SECTOR_SYMBOLS = {
     "NIFTY_FIN_SERVICE": "NSE:NIFTYFINSERVICE-INDEX",
 }
 
+NIFTY50_CONSTITUENTS = [
+    "NSE:ADANIENT-EQ", "NSE:ADANIPORTS-EQ", "NSE:APOLLOHOSP-EQ", "NSE:ASIANPAINT-EQ", "NSE:AXISBANK-EQ",
+    "NSE:BAJAJ-AUTO-EQ", "NSE:BAJFINANCE-EQ", "NSE:BAJAJFINSV-EQ", "NSE:BEL-EQ", "NSE:BPCL-EQ",
+    "NSE:BHARTIARTL-EQ", "NSE:BRITANNIA-EQ", "NSE:CIPLA-EQ", "NSE:COALINDIA-EQ", "NSE:DRREDDY-EQ",
+    "NSE:EICHERMOT-EQ", "NSE:GRASIM-EQ", "NSE:HCLTECH-EQ", "NSE:HDFCBANK-EQ", "NSE:HDFCLIFE-EQ",
+    "NSE:HEROMOTOCO-EQ", "NSE:HINDALCO-EQ", "NSE:HINDUNILVR-EQ", "NSE:ICICIBANK-EQ", "NSE:ITC-EQ",
+    "NSE:INDUSINDBK-EQ", "NSE:INFY-EQ", "NSE:JSWSTEEL-EQ", "NSE:KOTAKBANK-EQ", "NSE:LT-EQ",
+    "NSE:M&M-EQ", "NSE:MARUTI-EQ", "NSE:NTPC-EQ", "NSE:NESTLEIND-EQ", "NSE:ONGC-EQ",
+    "NSE:POWERGRID-EQ", "NSE:RELIANCE-EQ", "NSE:SBILIFE-EQ", "NSE:SHRIRAMFIN-EQ", "NSE:SBIN-EQ",
+    "NSE:SUNPHARMA-EQ", "NSE:TCS-EQ", "NSE:TATACONSUM-EQ", "NSE:TATAMOTORS-EQ", "NSE:TATASTEEL-EQ",
+    "NSE:TECHM-EQ", "NSE:TITAN-EQ", "NSE:TRENT-EQ", "NSE:ULTRACEMCO-EQ", "NSE:WIPRO-EQ",
+]
+
 
 @dataclass
 class SectorPerformance:
@@ -67,8 +80,8 @@ class IndiaMarketBreadthAnalyzer:
         now_str = datetime.now(IST).isoformat()
 
         # Benchmark return
-        nifty_ltp = float(nifty_quote.get("ltp") or nifty_quote.get("close") or 0.0)
-        nifty_prev = float(nifty_quote.get("prev_close") or nifty_quote.get("open") or nifty_ltp)
+        nifty_ltp = float(nifty_quote.get("lp") or nifty_quote.get("ltp") or nifty_quote.get("close") or 0.0)
+        nifty_prev = float(nifty_quote.get("prev_close_price") or nifty_quote.get("prev_close") or nifty_quote.get("open") or nifty_ltp)
         nifty_change_pct = round(((nifty_ltp - nifty_prev) / nifty_prev) * 100, 2) if nifty_prev > 0 else 0.0
 
         sectors: List[SectorPerformance] = []
@@ -77,8 +90,8 @@ class IndiaMarketBreadthAnalyzer:
         # Sectoral performance
         for sec_name, sym in SECTOR_SYMBOLS.items():
             q = sector_quotes.get(sym, {})
-            ltp = float(q.get("ltp") or q.get("close") or 0.0)
-            prev = float(q.get("prev_close") or q.get("open") or ltp)
+            ltp = float(q.get("lp") or q.get("ltp") or q.get("close") or 0.0)
+            prev = float(q.get("prev_close_price") or q.get("prev_close") or q.get("open") or ltp)
             chg = round(((ltp - prev) / prev) * 100, 2) if prev > 0 else 0.0
             rs = round(chg - nifty_change_pct, 2)
 
@@ -97,11 +110,24 @@ class IndiaMarketBreadthAnalyzer:
                 relative_strength=rs,
             ))
 
-        # If constituent quotes provided, count stock breadth
+        # If constituent quotes provided, count stock breadth across Nifty 50 stocks
         if constituent_quotes:
-            c_adv = sum(1 for c in constituent_quotes if float(c.get("change_pct", 0)) > 0)
-            c_dec = sum(1 for c in constituent_quotes if float(c.get("change_pct", 0)) < 0)
-            c_unc = len(constituent_quotes) - (c_adv + c_dec)
+            c_adv = 0
+            c_dec = 0
+            c_unc = 0
+            for c in constituent_quotes:
+                if "change_pct" in c:
+                    chg = float(c["change_pct"])
+                else:
+                    c_ltp = float(c.get("lp") or c.get("ltp") or c.get("close") or 0.0)
+                    c_prev = float(c.get("prev_close_price") or c.get("prev_close") or c.get("open") or c_ltp)
+                    chg = round(((c_ltp - c_prev) / c_prev) * 100, 2) if c_prev > 0 else 0.0
+                if chg > 0.05:
+                    c_adv += 1
+                elif chg < -0.05:
+                    c_dec += 1
+                else:
+                    c_unc += 1
             advances, declines, unchanged = c_adv, c_dec, c_unc
 
         total = advances + declines + unchanged

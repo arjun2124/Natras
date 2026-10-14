@@ -76,7 +76,7 @@ class StrategyRiskProfile:
         try:
             bid = float(quote.get("bid") or quote.get("b_price") or 0.0)
             ask = float(quote.get("ask") or quote.get("a_price") or 0.0)
-            ltp = float(quote.get("ltp") or quote.get("close") or quote.get("price") or 0.0)
+            ltp = float(quote.get("lp") or quote.get("ltp") or quote.get("close") or quote.get("price") or 0.0)
             vol = float(quote.get("volume") or quote.get("vol_traded_today") or 0.0)
         except (ValueError, TypeError) as exc:
             return False, f"Malformed quote numeric values: {exc}"
@@ -114,13 +114,17 @@ class StrategyRiskProfile:
             quote_dt: Optional[datetime] = None
             if isinstance(ts_val, (int, float)):
                 # epoch seconds or milliseconds
-                epoch_sec = ts_val if ts_val < 1e11 else ts_val / 1000.0
+                epoch_sec = float(ts_val) if float(ts_val) < 1e11 else float(ts_val) / 1000.0
                 quote_dt = datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
             elif isinstance(ts_val, str):
-                try:
-                    quote_dt = datetime.fromisoformat(ts_val)
-                except ValueError:
-                    return False, f"Unparseable quote timestamp format: {ts_val!r}"
+                if ts_val.isdigit():
+                    epoch_sec = float(ts_val) if float(ts_val) < 1e11 else float(ts_val) / 1000.0
+                    quote_dt = datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
+                else:
+                    try:
+                        quote_dt = datetime.fromisoformat(ts_val)
+                    except ValueError:
+                        return False, f"Unparseable quote timestamp format: {ts_val!r}"
 
             if quote_dt is not None:
                 # Compare against current_dt or now
@@ -130,14 +134,20 @@ class StrategyRiskProfile:
                 elif quote_dt.tzinfo is not None and now_ref.tzinfo is None:
                     now_ref = now_ref.replace(tzinfo=quote_dt.tzinfo)
 
-                diff = (now_ref - quote_dt).total_seconds()
-                if diff < -5.0:
-                    return False, f"Quote timestamp is in the future ({quote_dt.isoformat()})."
-                if diff > max_staleness_seconds:
-                    return False, (
-                        f"Stale option quote: age ({diff:.1f}s) exceeds max allowed "
-                        f"staleness ({max_staleness_seconds}s) [Quote TS: {quote_dt.isoformat()}]."
-                    )
+                # If timestamp represents trade date session (midnight UTC/IST, e.g. Fyers 'tt'), check matching date
+                if quote_dt.hour == 0 and quote_dt.minute == 0 and quote_dt.second == 0:
+                    from natras.data.session import IST
+                    if quote_dt.astimezone(IST).date() != now_ref.astimezone(IST).date():
+                        return False, f"Stale option quote date: {quote_dt.astimezone(IST).date()} != {now_ref.astimezone(IST).date()}"
+                else:
+                    diff = (now_ref - quote_dt).total_seconds()
+                    if diff < -5.0:
+                        return False, f"Quote timestamp is in the future ({quote_dt.isoformat()})."
+                    if diff > max_staleness_seconds:
+                        return False, (
+                            f"Stale option quote: age ({diff:.1f}s) exceeds max allowed "
+                            f"staleness ({max_staleness_seconds}s) [Quote TS: {quote_dt.isoformat()}]."
+                        )
 
         return True, "Option quote validated."
 

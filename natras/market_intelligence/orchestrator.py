@@ -17,14 +17,18 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from natras.adapters.upstox_market_data import UpstoxMarketDataClient
 from natras.data.session import IST
 from natras.db.database import DatabaseManager
 from natras.market_intelligence.economic_events.calendar import EconomicCalendar
 from natras.market_intelligence.global_market.tracker import GlobalMarketsTracker
-from natras.market_intelligence.india.breadth import IndiaMarketBreadthAnalyzer
+from natras.market_intelligence.india.breadth import (
+    NIFTY50_CONSTITUENTS,
+    SECTOR_SYMBOLS,
+    IndiaMarketBreadthAnalyzer,
+)
 from natras.market_intelligence.india.options_intel import OptionsIntelligenceAnalyzer
 from natras.market_intelligence.news.feed import NewsFeedCollector
 from natras.market_intelligence.regimes.detector import MarketRegimeDetector
@@ -55,8 +59,10 @@ class MarketIntelligenceOrchestrator:
         self,
         db_manager: Optional[DatabaseManager] = None,
         upstox_client: Optional[UpstoxMarketDataClient] = None,
+        quote_fetcher: Optional[Callable[[Sequence[str]], Dict[str, Any]]] = None,
     ) -> None:
         self.db = db_manager
+        self.quote_fetcher = quote_fetcher
         self.upstox = upstox_client or UpstoxMarketDataClient()
         self.breadth_analyzer = IndiaMarketBreadthAnalyzer()
         self.options_analyzer = OptionsIntelligenceAnalyzer()
@@ -76,8 +82,24 @@ class MarketIntelligenceOrchestrator:
 
         # 1. Breadth
         breadth_snap = None
+        constituent_quotes = None
+        if (not nifty_quote or not sector_quotes) and self.quote_fetcher:
+            try:
+                sym_list = ["NSE:NIFTY50-INDEX"] + list(SECTOR_SYMBOLS.values()) + NIFTY50_CONSTITUENTS
+                quotes = self.quote_fetcher(sym_list)
+                if "NSE:NIFTY50-INDEX" in quotes:
+                    nifty_quote = quotes["NSE:NIFTY50-INDEX"]
+                sector_quotes = {sym: quotes[sym] for sym in SECTOR_SYMBOLS.values() if sym in quotes}
+                constituent_quotes = [quotes[s] for s in NIFTY50_CONSTITUENTS if s in quotes]
+            except Exception as exc:
+                logger.warning("Quote fetcher failed for breadth analysis: %s", exc)
+
         if nifty_quote and sector_quotes:
-            breadth_snap = self.breadth_analyzer.analyze(nifty_quote, sector_quotes)
+            breadth_snap = self.breadth_analyzer.analyze(
+                nifty_quote,
+                sector_quotes,
+                constituent_quotes=constituent_quotes,
+            )
 
         # 2. Options Intelligence (Live Upstox or Fallback)
         options_intel_dict: Optional[Dict[str, Any]] = None
@@ -203,5 +225,6 @@ class MarketIntelligenceOrchestrator:
             "dii_net_amount": opt.get("dii_net_flow"),
             "global_markets": report.global_markets,
             "upcoming_events": report.upcoming_events,
+            "market_breadth": report.breadth,
         }
         self.db.save_market_intelligence_snapshot(snapshot_payload)

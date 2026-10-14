@@ -103,7 +103,7 @@ class TelegramLiveBot:
             return self._cmd_strategy_status()
         elif cmd in ("/market_intel", "/regime"):
             return self._cmd_market_intel()
-        elif cmd == "/shadow_status":
+        elif cmd in ("/shadow_status", "/shadow_candidates", "/shadow"):
             return self._cmd_shadow_status()
         elif cmd == "/promotion_requests":
             return self._cmd_promotion_requests()
@@ -111,6 +111,8 @@ class TelegramLiveBot:
             return self._cmd_approve(arg)
         elif cmd == "/reject":
             return self._cmd_reject(arg)
+        elif cmd in ("/healer_status", "/healer"):
+            return self._cmd_healer_status()
         elif cmd == "/errors":
             return self._cmd_errors()
         elif cmd == "/help":
@@ -273,41 +275,78 @@ class TelegramLiveBot:
             return f"Failed to read logs: {exc}"
 
     def _cmd_market_intel(self) -> str:
-        from natras.market_intelligence.orchestrator import MarketIntelligenceOrchestrator
-
         try:
-            orchestrator = MarketIntelligenceOrchestrator()
-            report = orchestrator.generate_report()
-            reg = report.regime
+            snap = self.db.get_latest_market_intelligence() if self.db else None
+            if not snap:
+                from natras.market_intelligence.orchestrator import MarketIntelligenceOrchestrator
+                orch = MarketIntelligenceOrchestrator()
+                report = orch.generate_report()
+                snap = report.to_dict()
+                snap["market_breadth"] = snap.get("breadth")
+
+            reg = snap.get("regime") or {}
+            breadth = snap.get("market_breadth") or snap.get("breadth") or {}
+            events = snap.get("upcoming_events") or []
+            vix = snap.get("vix", 14.0)
+            pcr = snap.get("pcr")
+            max_pain = snap.get("max_pain")
+
+            breadth_txt = ""
+            if breadth:
+                adv = breadth.get("advances", 0)
+                dec = breadth.get("declines", 0)
+                ad_ratio = breadth.get("advance_decline_ratio", 1.0)
+                top_sec = breadth.get("top_outperforming_sector") or "None"
+                breadth_txt = (
+                    f"• NIFTY 50 Breadth: {adv} Adv / {dec} Dec (A/D: {ad_ratio:.2f})\n"
+                    f"• Top Sector: {top_sec}\n"
+                )
+
+            options_txt = ""
+            if pcr is not None:
+                options_txt = f"• Options PCR / Max Pain: {pcr:.2f} / {max_pain:,.0f}\n"
+
             events_txt = ""
-            if report.upcoming_events:
-                events_txt = f"\n• Next Event: {report.upcoming_events[0]['headline'][:50]}"
+            if events and isinstance(events, list) and len(events) > 0:
+                ev = events[0]
+                headline = ev.get("headline", "")[:45] if isinstance(ev, dict) else str(ev)[:45]
+                events_txt = f"• Next Macro Event: {headline}\n"
+
+            summary = reg.get("summary_text", "")
+            summary_fmt = f"\n_{summary}_" if summary else ""
 
             return (
                 "🌐 *MARKET INTELLIGENCE & REGIME*\n"
-                f"• Trend Regime: {reg['trend_regime']}\n"
-                f"• Volatility: {reg['volatility_regime']}\n"
-                f"• Global Sentiment: {reg['global_sentiment']}\n"
-                f"• Confidence: {reg['confidence_score']:.0%}\n"
-                f"• Event Risk: {'HIGH' if reg['is_event_day'] else 'NORMAL'}"
-                f"{events_txt}\n\n"
-                f"_{reg['summary_text']}_"
+                f"• Trend Regime: {reg.get('trend_regime', 'UNKNOWN')}\n"
+                f"• Volatility: {reg.get('volatility_regime', 'NORMAL')} (VIX: {vix:.2f})\n"
+                f"• Global Sentiment: {reg.get('global_sentiment', 'NEUTRAL')}\n"
+                f"{breadth_txt}"
+                f"{options_txt}"
+                f"• Event Risk: {'HIGH' if reg.get('is_event_day') else 'NORMAL'}\n"
+                f"{events_txt}"
+                f"• Synthesis Confidence: {reg.get('confidence_score', 0.6):.0%}"
+                f"{summary_fmt}"
             )
         except Exception as exc:
-            return f"Market intelligence generation error: {exc}"
+            return f"Market intelligence error: {exc}"
 
     def _cmd_shadow_status(self) -> str:
         try:
             from natras.shadow.shadow_engine import ShadowEngine
-            engine = ShadowEngine()
+            engine = ShadowEngine(auto_seed=True)
             active = engine.candidates
             if not active:
                 return "👥 *SHADOW STRATEGIES*\nNo shadow variants currently active."
             lines = [f"👥 *SHADOW STRATEGIES ({len(active)})*"]
             for c in active.values():
+                pos_info = "Flat"
+                if c.active_position:
+                    pos_info = f"Virtual {c.active_position['direction']} @ {c.active_position['spot_entry']:.2f}"
+                promo_tag = " 🌟 [READY FOR /approve]" if c.status == "PROMOTION_CANDIDATE" else ""
                 lines.append(
                     f"• ID: `{c.candidate_id}`\n"
-                    f"  Name: {c.name}\n"
+                    f"  Name: {c.name}{promo_tag}\n"
+                    f"  Status: {c.status} | Virtual Position: {pos_info}\n"
                     f"  Sessions: {c.sessions_evaluated} | Trades: {c.trade_count} (Wins: {c.win_count})\n"
                     f"  Net PnL: Rs {c.net_pnl:,.2f} | PF: {c.profit_factor:.2f}"
                 )
@@ -368,10 +407,19 @@ class TelegramLiveBot:
         except Exception as exc:
             return f"Rejection error: {exc}"
 
+    def _cmd_healer_status(self) -> str:
+        try:
+            from natras.resilience.auto_healer import AutoHealer
+            healer = AutoHealer.get_instance()
+            return healer.get_status_summary()
+        except Exception as exc:
+            return f"Healer status error: {exc}"
+
     def _cmd_help(self) -> str:
         return (
             "🤖 *NAT RAS TELEGRAM COMMANDS*\n\n"
             "/status - System readiness, time, cutoff status\n"
+            "/healer_status - Security watchdog and auto-repair status\n"
             "/auth_status - FYERS and Upstox token validity\n"
             "/feed_status - Live candle feed status and counts\n"
             "/paper_status - Paper trading state and executed orders\n"

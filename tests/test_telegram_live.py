@@ -74,6 +74,14 @@ def test_telegram_commands_dispatch(db):
     promo_resp = bot.handle_command("/promotion_requests")
     assert "PROMOTION REQUESTS" in promo_resp
 
+    # Test /healer_status and /healer
+    healer_resp = bot.handle_command("/healer_status")
+    assert "SECURITY & AUTO-HEALER STATUS" in healer_resp
+    assert "Watchdog State" in healer_resp
+
+    healer_alias_resp = bot.handle_command("/healer")
+    assert "SECURITY & AUTO-HEALER STATUS" in healer_alias_resp
+
     # Test /approve without argument
     appr_resp = bot.handle_command("/approve")
     assert "Usage: `/approve <candidate_id>`" in appr_resp

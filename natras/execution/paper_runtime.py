@@ -18,10 +18,12 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from natras.adapters.telegram_live import TelegramLiveBot
+from natras.shadow.shadow_engine import ShadowEngine
 from natras.config.constants import (
     MARKET_TIMEZONE_STR,
     OrderIntent,
@@ -78,6 +80,7 @@ class PaperRuntime:
         option_chain: Optional[OptionChain] = None,
         telegram_bot: Optional[TelegramLiveBot] = None,
         quote_fetcher: Optional[Callable[[List[str]], Dict[str, Any]]] = None,
+        shadow_engine: Optional[ShadowEngine] = None,
     ) -> None:
         self.settings = settings or load_settings()
         self.db = db or DatabaseManager(self.settings.database_path)
@@ -85,6 +88,12 @@ class PaperRuntime:
         self.risk_governor = RiskGovernor(settings=self.settings)
         self.risk_profile = risk_profile or get_default_risk_profile()
         self.strategy = MomentumWickStrategy()
+        self.shadow_engine = shadow_engine or ShadowEngine(
+            risk_profile=self.risk_profile,
+            auto_seed=True,
+        )
+        self.shadow_engine.warmup_from_db()
+        self._warmup_baseline_strategy()
 
         # Paper executor with realistic slippage and brokerage
         self.executor = PaperExecutor(
@@ -108,6 +117,36 @@ class PaperRuntime:
 
         # Phase 3 Requirement: Recover active open positions from database on startup
         self.recover_open_positions()
+
+    def _warmup_baseline_strategy(self, limit: int = 200) -> int:
+        """Warm up baseline strategy candle history from market.db."""
+        p = Path("data") / "market.db"
+        if not p.exists() or self.strategy.history:
+            return 0
+        try:
+            import sqlite3
+            from natras.data.candle_engine import validate_candle
+
+            conn = sqlite3.connect(p)
+            rows = conn.execute(
+                "SELECT symbol, ts, open, high, low, close, volume FROM candles "
+                "WHERE symbol LIKE '%NIFTY50%' ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            if not rows:
+                return 0
+            candles = []
+            for r in reversed(rows):
+                sym, ts_str, o, h, l, c, v = r
+                ts = datetime.fromisoformat(ts_str)
+                candles.append(validate_candle(sym, ts, o, h, l, c, v))
+            self.strategy.history = candles
+            logger.info("Warmed up baseline strategy with %d historical candles.", len(candles))
+            return len(candles)
+        except Exception as exc:
+            logger.warning("Failed to warmup baseline strategy: %s", exc)
+            return 0
 
     def recover_open_positions(self) -> int:
         """Recover active open positions from SQLite database across restarts."""
@@ -164,15 +203,23 @@ class PaperRuntime:
     ) -> List[ExecutionResult]:
         """Process completed 5-minute spot candle from data feed.
 
-        1. Evaluates candle against MomentumWickStrategy rules.
-        2. If signal generated and 15:00 cutoff not reached:
+        1. Evaluates candle across active shadow candidate variants.
+        2. Evaluates candle against baseline MomentumWickStrategy rules.
+        3. If signal generated and 15:00 cutoff not reached:
            - Selects ATM/ITM option contract via OptionChain.
            - Fetches real quote and validates spread/volume.
            - Submits paper entry order with slippage and brokerage.
            - Initializes SteppedTrailingStop tracker.
            - Notifies Telegram.
-        3. Updates trailing stops on any existing positions.
+        4. Updates trailing stops on any existing positions.
         """
+        # Always feed spot candle to shadow strategy engine
+        if self.shadow_engine:
+            try:
+                self.shadow_engine.on_candle(candle)
+            except Exception as exc:
+                logger.error("Shadow engine candle evaluation error: %s", exc)
+
         results: List[ExecutionResult] = []
         now = current_dt or candle.timestamp
         now_ist = self.safety_guard.to_ist(now)
@@ -186,7 +233,7 @@ class PaperRuntime:
             results.extend(eod_results)
             return results
 
-        # 1. Evaluate candle in strategy
+        # 1. Evaluate candle in baseline strategy
         signals = self.strategy.on_candle(candle)
         if not signals:
             logger.debug("Candle %s produced no signal: %s", candle.timestamp, self.strategy.last_rejection_reason)
@@ -335,7 +382,7 @@ class PaperRuntime:
                 return None
 
             # Quoted entry price is ask price for BUY order
-            ask = float(q.get("ask") or q.get("a_price") or q.get("ltp") or q.get("close", 0))
+            ask = float(q.get("ask") or q.get("a_price") or q.get("lp") or q.get("ltp") or q.get("close", 0))
             if not math.isfinite(ask) or ask <= 0:
                 logger.warning("Invalid non-finite or non-positive ask price for %s: %s", symbol, ask)
                 return None
@@ -382,7 +429,7 @@ class PaperRuntime:
                     logger.warning("Live quote for %s failed validation: %s", sym, reason)
                     continue
 
-                ltp = float(q.get("ltp") or q.get("close") or q.get("bid", 0.0))
+                ltp = float(q.get("lp") or q.get("ltp") or q.get("close") or q.get("bid", 0.0))
                 if not math.isfinite(ltp) or ltp <= 0:
                     continue
 

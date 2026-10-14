@@ -13,14 +13,18 @@ Data only. No orders. Secrets are never sent to Telegram or logged.
 '''
 import logging
 import os
+import queue
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 import requests
@@ -32,8 +36,8 @@ from natras.adapters.fyers_auth import (
     parse_auth_code,
 )
 from natras.cli._env import load_env
-from natras.cli.fyers_auto_login import wait_for_redirect
 from natras.data.session import IST
+from natras.resilience.auto_healer import AutoHealer
 
 LOG_PATH = Path('data') / 'logs' / 'autostart.log'
 LOCK_PATH = Path('data') / 'autostart.lock'
@@ -69,35 +73,44 @@ class Notifier:
             log.warning('Telegram send failed: %s', type(exc).__name__)
             return False
 
-    def wait_for_message(self, match, timeout: int):
+    def wait_for_message(self, match, timeout: int, stop_event: Optional[threading.Event] = None):
         '''Return the first text from the authorized chat that satisfies match(text).'''
         if not self.enabled:
             return None
         base = f'https://api.telegram.org/bot{self._token}/getUpdates'
         offset = None
         try:
-            flush = requests.get(base, params={'offset': -1, 'timeout': 0}, timeout=15).json()
+            flush = requests.get(base, params={'offset': -5, 'timeout': 0}, timeout=10).json()
             items = flush.get('result', [])
+            for item in items:
+                msg = item.get('message') or {}
+                msg_time = msg.get('date', 0)
+                if (time.time() - msg_time < 120) and str(msg.get('chat', {}).get('id')) == str(self._chat):
+                    t = msg.get('text') or msg.get('caption') or ''
+                    if match(t):
+                        return t
             if items:
                 offset = items[-1]['update_id'] + 1
         except (requests.RequestException, ValueError, KeyError):
             pass
         end = time.time() + timeout
         while time.time() < end:
-            params = {'timeout': 20}
+            if stop_event and stop_event.is_set():
+                break
+            params = {'timeout': 2}
             if offset is not None:
                 params['offset'] = offset
             try:
-                data = requests.get(base, params=params, timeout=30).json()
+                data = requests.get(base, params=params, timeout=10).json()
             except (requests.RequestException, ValueError):
-                time.sleep(3)
+                time.sleep(1)
                 continue
             for upd in data.get('result', []):
                 offset = upd['update_id'] + 1
                 msg = upd.get('message') or {}
                 if str(msg.get('chat', {}).get('id')) != str(self._chat):
                     continue
-                text = msg.get('text', '')
+                text = msg.get('text') or msg.get('caption') or ''
                 if match(text):
                     return text
         return None
@@ -109,9 +122,36 @@ def in_window(now: datetime) -> bool:
     return WINDOW_START <= (now.hour, now.minute) < WINDOW_END
 
 
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        STILL_ACTIVE = 259
+        exit_code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return exit_code.value == STILL_ACTIVE
+    except Exception:
+        return True
+
+
 def lock_active() -> bool:
     try:
-        return time.time() - LOCK_PATH.stat().st_mtime < LOCK_FRESH_SECONDS
+        if not LOCK_PATH.exists():
+            return False
+        mtime_fresh = (time.time() - LOCK_PATH.stat().st_mtime) < LOCK_FRESH_SECONDS
+        try:
+            pid = int(LOCK_PATH.read_text().strip())
+            if not _is_pid_alive(pid):
+                return False
+        except (ValueError, OSError):
+            pass
+        return mtime_fresh
     except OSError:
         return False
 
@@ -135,11 +175,6 @@ def wait_for_internet(max_seconds: int = 180) -> bool:
     return False
 
 
-def _extract_url(text: str) -> str:
-    found = re.search(r'https?://\S+', text)
-    return found.group(0) if found else text.strip()
-
-
 def ensure_fyers_token(notifier: Notifier) -> bool:
     creds = FyersCredentials.from_env()
     auth = FyersAuthenticator(creds)
@@ -152,65 +187,208 @@ def ensure_fyers_token(notifier: Notifier) -> bool:
         pass
 
     parsed = urlparse(creds.redirect_uri)
+    port = parsed.port or 5000
     url = auth.get_login_url()
+
+    print("\n" + "=" * 64, flush=True)
+    print("              FYERS AUTHENTICATION REQUIRED", flush=True)
+    print("=" * 64, flush=True)
+    print(f"Opening login URL in your browser:\n{url}\n", flush=True)
+    print("HOW TO COMPLETE LOGIN:", flush=True)
+    print("1. Log in with your FYERS credentials in the browser tab that opens.", flush=True)
+    print("2. If redirected to http://127.0.0.1, it will be captured automatically.", flush=True)
+    print("3. If redirected to https://127.0.0.1 (showing connection error / blank):", flush=True)
+    print("   -> Copy the address-bar URL or auth_code,", flush=True)
+    print("   -> Paste it here in this window and press ENTER, OR", flush=True)
+    print("   -> Send the URL or auth_code to your Telegram bot.", flush=True)
+    print("-" * 64, flush=True)
+    print("Waiting for login (via browser redirect, console paste, or Telegram)...", flush=True)
+    print("Paste redirected URL or auth_code here: ", end="", flush=True)
+
     try:
-        print(f"FYERS login needed. Opening login URL:\n{url}", flush=True)
-        if parsed.scheme == 'http':
-            notifier.send(
-                'NAT RAS: FYERS login needed. Open this link ON THIS LAPTOP within 15 minutes:\n' + url
-            )
-            try:
-                webbrowser.open(url)
-            except Exception:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    code_queue: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+
+    # 1. Local HTTP Redirect Server
+    def _local_server_worker() -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    code = parse_auth_code(self.path)
+                    code_queue.put(('browser redirect', code))
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(
+                        b'<html><body style="font-family:sans-serif;text-align:center;padding:50px;">'
+                        b'<h2 style="color:#10b981;">&#10004; NAT RAS Login Successful!</h2>'
+                        b'<p>Authentication received. You may now close this tab and return to the application.</p>'
+                        b'</body></html>'
+                    )
+                except Exception:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'NAT RAS: Could not parse auth_code from request.')
+
+            def log_message(self, *args):
                 pass
-            redirected = wait_for_redirect(parsed.port or 5000, timeout=LOGIN_TIMEOUT_SECONDS)
-        else:
-            notifier.send(
-                'NAT RAS: FYERS login needed. 1) Open this link and log in:\n' + url +
-                '\n2) The browser will then show a connection error page. That is expected.\n'
-                '3) Copy the FULL address-bar URL (it contains auth_code=) and send it here.'
-            )
+
+        try:
+            server = HTTPServer(('127.0.0.1', port), Handler)
+            server.timeout = 1.0
+            while not stop_event.is_set():
+                server.handle_request()
+            server.server_close()
+        except OSError:
+            log.debug("Local redirect server port %d unavailable or already in use.", port)
+
+    # 2. Laptop Console Reader
+    def _console_reader_worker() -> None:
+        while not stop_event.is_set():
             try:
-                webbrowser.open(url)
+                line = sys.stdin.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                code = parse_auth_code(line)
+                code_queue.put(('laptop console', code))
+                return
+            except FyersAuthError:
+                print("\n[NAT RAS] Could not extract auth_code from entered text.")
+                print("Please copy the FULL address-bar URL and paste again: ", end="", flush=True)
             except Exception:
-                pass
-            text = notifier.wait_for_message(lambda t: 'auth_code=' in t, LOGIN_TIMEOUT_SECONDS)
-            if text is None:
-                raise TimeoutError('No login URL received.')
-            redirected = _extract_url(text)
-        auth.exchange_auth_code(parse_auth_code(redirected))
-    except TimeoutError:
-        notifier.send('NAT RAS: FYERS login timed out. Collection NOT started.')
+                break
+
+    # 3. Telegram Notifier Listener
+    def _telegram_worker() -> None:
+        if not notifier.enabled:
+            return
+        notifier.send(
+            'NAT RAS: FYERS login needed.\n'
+            '1) Open this link and log in:\n' + url + '\n\n'
+            '2) After login, copy the address-bar URL (or auth_code) and send it here '
+            '(or paste it into your laptop console).'
+        )
+        while not stop_event.is_set():
+            text = notifier.wait_for_message(
+                lambda t: bool(t and t.strip()),
+                timeout=LOGIN_TIMEOUT_SECONDS,
+                stop_event=stop_event,
+            )
+            if not text or stop_event.is_set():
+                break
+            try:
+                code = parse_auth_code(text)
+                code_queue.put(('Telegram chat', code))
+                return
+            except FyersAuthError:
+                notifier.send(
+                    'NAT RAS: Could not extract a valid FYERS auth_code from your message.\n'
+                    'Please copy and send the FULL URL from the browser address bar.'
+                )
+
+    threads = [
+        threading.Thread(target=_local_server_worker, daemon=True, name="fyers-redirect-server"),
+        threading.Thread(target=_console_reader_worker, daemon=True, name="fyers-console-reader"),
+        threading.Thread(target=_telegram_worker, daemon=True, name="fyers-telegram-worker"),
+    ]
+    for t in threads:
+        t.start()
+
+    try:
+        source, code = code_queue.get(timeout=LOGIN_TIMEOUT_SECONDS)
+        stop_event.set()
+    except queue.Empty:
+        stop_event.set()
+        msg = 'NAT RAS: FYERS login timed out (15 min). Collection NOT started.'
+        print(f"\n[NAT RAS] {msg}", flush=True)
+        notifier.send(msg)
         return False
+
+    try:
+        print(f"\n[NAT RAS] Received auth code via {source}. Exchanging for access token...", flush=True)
+        auth.exchange_auth_code(code)
     except FyersAuthError as exc:
-        notifier.send(f'NAT RAS: FYERS login failed: {exc}')
+        msg = f'NAT RAS: FYERS token exchange failed: {exc}'
+        print(f"\n[NAT RAS] {msg}", flush=True)
+        notifier.send(msg)
         return False
-    notifier.send('NAT RAS: FYERS login successful. Starting data collection & paper engine.')
+
+    success_msg = 'NAT RAS: FYERS login successful. Starting data collection & paper engine.'
+    print(f"\n[NAT RAS] {success_msg}\n", flush=True)
+    notifier.send(success_msg)
     return True
 
 
 def run_collector(notifier: Notifier, force: bool = False) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    healer = AutoHealer.get_instance()
+    healer.telegram_notifier = notifier.send
     restarts = 0
     print("Launching collector, paper engine & market intelligence...", flush=True)
     while True:
         if not force and not in_window(datetime.now(IST)):
             break
+
+        # Proactively check internet before launching
+        if not healer.check_internet():
+            healer.wait_for_network_recovery(max_wait_seconds=300.0)
+
         with open(LOG_PATH.parent / 'collector.log', 'a', encoding='utf-8') as out:
             proc = subprocess.Popen(
                 [sys.executable, '-m', 'natras.cli.collect'], stdout=out, stderr=subprocess.STDOUT
             )
+            # Supervisor watchdog loop: check every 10 seconds
             while proc.poll() is None:
                 touch_lock()
-                time.sleep(30)
+                # Check for frozen / stalled process via heartbeat
+                is_fresh, age = healer.is_heartbeat_healthy(max_age_seconds=180.0)
+                if age > 180.0 and in_window(datetime.now(IST)):
+                    healer.record_incident(
+                        category="FEED_STALL",
+                        action_taken=f"Terminated frozen collector process PID {proc.pid} (heartbeat age {age:.0f}s) and auto-restarting",
+                        details="Collector process became unresponsive during market hours",
+                        severity="WARNING",
+                        notify_telegram=True,
+                    )
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+                time.sleep(10)
+
         if proc.returncode == 0:
             break
+
         restarts += 1
-        notifier.send(f'NAT RAS: collector exited with code {proc.returncode} (restart {restarts}).')
+        if proc.returncode in (4294967295, -1):
+            details = "Collector process was recycled/restarted."
+            sev = "INFO"
+        else:
+            details = f"Collector process exited with return code {proc.returncode}."
+            sev = "WARNING"
+
+        healer.record_incident(
+            category="PROCESS_RECYCLED",
+            action_taken=f"Auto-respawning fresh collector process (restart {restarts})",
+            details=details,
+            severity=sev,
+            notify_telegram=True,
+        )
+
         if restarts > MAX_COLLECTOR_RESTARTS:
-            notifier.send('NAT RAS: too many failures. Collection stopped. Check data/logs/collector.log.')
+            notifier.send('NAT RAS: Maximum supervisor restarts reached. Manual check advised in data/logs/collector.log.')
             return
-        time.sleep(15 * restarts)
+
+        time.sleep(min(15 * restarts, 60))
 
 
 def end_of_day_summary(notifier: Notifier) -> None:
@@ -252,19 +430,21 @@ def main() -> int:
         print(msg)
         return 0
     touch_lock()
-    if not wait_for_internet():
-        log.error('No internet; exiting.')
-        return 1
-    notifier.send('NAT RAS: laptop online. Checking FYERS session.')
-    if not ensure_fyers_token(notifier):
-        return 1
-    run_collector(notifier, force=force)
-    end_of_day_summary(notifier)
     try:
-        LOCK_PATH.unlink()
-    except OSError:
-        pass
-    return 0
+        if not wait_for_internet():
+            log.error('No internet; exiting.')
+            return 1
+        notifier.send('NAT RAS: laptop online. Checking FYERS session.')
+        if not ensure_fyers_token(notifier):
+            return 1
+        run_collector(notifier, force=force)
+        end_of_day_summary(notifier)
+        return 0
+    finally:
+        try:
+            LOCK_PATH.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':

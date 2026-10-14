@@ -138,6 +138,16 @@ class MomentumWickStrategy(BaseStrategy):
         self.trail_gap_pp = trail_gap_pp
         self.fixed_target_pp = fixed_target_pp
         self.lots = lots
+        if isinstance(entry_start_time, str):
+            h, m = map(int, entry_start_time.split(":")[:2])
+            entry_start_time = time(h, m)
+        if isinstance(no_new_entries_time, str):
+            h, m = map(int, no_new_entries_time.split(":")[:2])
+            no_new_entries_time = time(h, m)
+        if isinstance(eod_square_off_time, str):
+            h, m = map(int, eod_square_off_time.split(":")[:2])
+            eod_square_off_time = time(h, m)
+
         self.entry_start_time = entry_start_time
         self.no_new_entries_time = no_new_entries_time
         self.eod_square_off_time = eod_square_off_time
@@ -344,6 +354,9 @@ class MomentumWickStrategy(BaseStrategy):
             c_time = current_dt.replace(tzinfo=self.tz).time()
         else:
             c_time = current_dt.astimezone(self.tz).time()
+        if isinstance(self.eod_square_off_time, str):
+            h, m = map(int, self.eod_square_off_time.split(":")[:2])
+            self.eod_square_off_time = time(h, m)
         return c_time >= self.eod_square_off_time
 
     def get_status(self) -> Dict[str, Any]:

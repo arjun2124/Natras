@@ -15,8 +15,24 @@ from natras.data.session import IST
 def test_parse_auth_code():
     url = 'http://127.0.0.1/?s=ok&code=200&auth_code=ABC123&state=x'
     assert parse_auth_code(url) == 'ABC123'
+    assert parse_auth_code('https://127.0.0.1:5000/callback?s=ok&code=200&auth_code=XYZ789') == 'XYZ789'
+    assert parse_auth_code('127.0.0.1:5000/callback?s=ok&auth_code=XYZ789') == 'XYZ789'
+    assert parse_auth_code('auth_code=ABC123') == 'ABC123'
+    assert parse_auth_code('auth_code = ABC123') == 'ABC123'
+    assert parse_auth_code('auth_code: ABC123') == 'ABC123'
+    assert parse_auth_code('?auth_code=ABC123&state=x') == 'ABC123'
+    assert parse_auth_code('https://127.0.0.1:5000/callback#auth_code=ABC123') == 'ABC123'
+    assert parse_auth_code('"https://127.0.0.1:5000/callback?auth_code=ABC123"') == 'ABC123'
+    assert parse_auth_code('<https://127.0.0.1:5000/callback?auth_code=ABC123>') == 'ABC123'
+    assert parse_auth_code('Here is URL: https://127.0.0.1:5000/callback?auth_code=ABC123 done') == 'ABC123'
+    jwt_sample = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.samplepayload.sig'
+    assert parse_auth_code(jwt_sample) == jwt_sample
     with pytest.raises(FyersAuthError):
         parse_auth_code('http://127.0.0.1/?s=ok')
+    with pytest.raises(FyersAuthError):
+        parse_auth_code('')
+    with pytest.raises(FyersAuthError):
+        parse_auth_code('hello world')
 
 
 def test_credentials_missing_lists_names_only():
