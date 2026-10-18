@@ -1,12 +1,15 @@
 """Paper trading execution engine with fail-closed safety and persistent state."""
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from natras.config.constants import (
+    MARKET_TIMEZONE_STR,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -24,6 +27,8 @@ from natras.db.models import (
 from natras.risk.governor import RiskGovernor
 from natras.safety.guards import SafetyGuard
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ExecutionResult:
@@ -34,6 +39,73 @@ class ExecutionResult:
     message: str
     fill_price: Optional[float] = None
     position_id: Optional[str] = None
+
+
+@dataclass
+class OptionChargesBreakdown:
+    """Official FYERS and Indian regulatory charge schedule for NSE Equity Options."""
+    brokerage: float = 0.0
+    stt: float = 0.0
+    txn_fee: float = 0.0
+    gst: float = 0.0
+    stamp_duty: float = 0.0
+    sebi_ipft: float = 0.0
+    total_charges: float = 0.0
+
+
+def compute_option_charges(
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    brokerage_per_order: float = 20.0,
+    is_buy_entry: bool = True,
+    include_statutory_taxes: bool = True,
+) -> OptionChargesBreakdown:
+    """Compute official FYERS & NSE Option trading charges and statutory taxes.
+
+    Specifications (NSE Equity Options):
+    - Brokerage: Flat ₹20 per executed order (₹40 round-trip standard for FYERS)
+    - STT (Securities Transaction Tax): 0.1% on sell-side premium turnover (Finance Act 2024)
+    - NSE Exchange Turnover Charges: 0.03503% on total premium turnover
+    - Stamp Duty: 0.003% on buy-side premium turnover
+    - SEBI Turnover Fee: ₹10 per Crore (0.0001% on total turnover)
+    - IPFT (Investor Protection Fund): ₹50 per Crore (0.0005% on total turnover)
+    - GST: 18% on (Brokerage + NSE Txn Charges + IPFT)
+    """
+    total_brokerage = round(brokerage_per_order * 2.0, 2)
+    if not include_statutory_taxes or total_brokerage == 0.0:
+        return OptionChargesBreakdown(
+            brokerage=total_brokerage,
+            total_charges=total_brokerage,
+        )
+
+    buy_price = entry_price if is_buy_entry else exit_price
+    sell_price = exit_price if is_buy_entry else entry_price
+
+    buy_turnover = buy_price * quantity
+    sell_turnover = sell_price * quantity
+    total_turnover = buy_turnover + sell_turnover
+
+    stt = round(sell_turnover * 0.001, 2)
+    txn_fee = round(total_turnover * 0.0003503, 2)
+    stamp_duty = round(buy_turnover * 0.00003, 2)
+    sebi_fee = round(total_turnover * 0.000001, 2)
+    ipft = round(total_turnover * 0.000005, 2)
+    gst = round((total_brokerage + txn_fee + ipft) * 0.18, 2)
+
+    total_charges = round(
+        total_brokerage + stt + txn_fee + stamp_duty + sebi_fee + ipft + gst, 2
+    )
+    return OptionChargesBreakdown(
+        brokerage=total_brokerage,
+        stt=stt,
+        txn_fee=txn_fee,
+        gst=gst,
+        stamp_duty=stamp_duty,
+        sebi_ipft=round(sebi_fee + ipft, 2),
+        total_charges=total_charges,
+    )
+
 
 
 class PaperExecutor:
@@ -53,13 +125,71 @@ class PaperExecutor:
         safety_guard: SafetyGuard,
         risk_governor: RiskGovernor,
         settings: Settings,
+        entry_slippage: float = 0.0,
+        exit_slippage: float = 0.0,
+        brokerage_per_order: float = 0.0,
+        risk_profile_id: str = "v2.2.0-research-momentum-wick-default",
+        include_statutory_taxes: bool = True,
     ) -> None:
         self.db = db
         self.safety_guard = safety_guard
         self.risk_governor = risk_governor
         self.settings = settings
+        self.entry_slippage = entry_slippage
+        self.exit_slippage = exit_slippage
+        self.brokerage_per_order = brokerage_per_order
+        self.risk_profile_id = risk_profile_id
+        self.include_statutory_taxes = include_statutory_taxes
         self.daily_realized_pnl = 0.0
         self.daily_trades_count = 0
+        self._recover_daily_counters()
+
+    def _recover_daily_counters(self) -> None:
+        """Recover daily_realized_pnl and daily_trades_count from SQLite for today's session."""
+        try:
+            today_str = datetime.now(ZoneInfo(MARKET_TIMEZONE_STR)).date().isoformat()
+            conn = self.db.get_connection()
+            row_pnl = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM positions "
+                "WHERE closed_at LIKE ?",
+                (f"{today_str}%",),
+            ).fetchone()
+            if row_pnl and row_pnl[0] is not None:
+                self.daily_realized_pnl = round(float(row_pnl[0]), 2)
+
+            row_trades = conn.execute(
+                "SELECT COUNT(*) FROM orders "
+                "WHERE status = 'FILLED' AND executed_at LIKE ?",
+                (f"{today_str}%",),
+            ).fetchone()
+            if row_trades and row_trades[0] is not None:
+                self.daily_trades_count = int(row_trades[0])
+
+            if not getattr(self.db, "_is_memory", False):
+                conn.close()
+        except Exception as exc:
+            logger.warning("Could not recover daily executor counters: %s", exc)
+
+    @classmethod
+    def with_realistic_assumptions(
+        cls,
+        db: DatabaseManager,
+        safety_guard: SafetyGuard,
+        risk_governor: RiskGovernor,
+        settings: Settings,
+        include_statutory_taxes: bool = True,
+    ) -> "PaperExecutor":
+        """Factory initializing PaperExecutor with realistic slippage, brokerage, and statutory taxes."""
+        return cls(
+            db=db,
+            safety_guard=safety_guard,
+            risk_governor=risk_governor,
+            settings=settings,
+            entry_slippage=0.50,
+            exit_slippage=0.50,
+            brokerage_per_order=20.0,
+            include_statutory_taxes=include_statutory_taxes,
+        )
 
     def submit_order(
         self,
@@ -82,6 +212,23 @@ class PaperExecutor:
         cid = client_order_id or f"paper_{uuid.uuid4().hex[:12]}"
         now_ist = self.safety_guard.to_ist(current_dt)
         now_iso = now_ist.isoformat()
+
+        # 0. Check for duplicate client_order_id submission
+        if self.db.get_order(cid) is not None:
+            msg = f"Duplicate client_order_id '{cid}' already exists."
+            self._journal_event(
+                event_type="ORDER_REJECTED",
+                strategy_id=strategy_id,
+                symbol=symbol,
+                payload={"client_order_id": cid, "reason": msg},
+                message=msg,
+            )
+            return ExecutionResult(
+                success=False,
+                order_id=cid,
+                status=OrderStatus.REJECTED,
+                message=msg,
+            )
 
         order = OrderRecord(
             client_order_id=cid,
@@ -117,8 +264,28 @@ class PaperExecutor:
                 message=order.reason,
             )
 
-        # 2. Risk Governor Verification
+        # 2. Risk Governor Verification & Matching Position Verification for EXIT
         open_positions = self.db.get_open_positions(strategy_id=strategy_id)
+        if intent_val == OrderIntent.EXIT.value:
+            matching_positions = [p for p in open_positions if p.symbol == symbol]
+            if not matching_positions:
+                order.status = OrderStatus.REJECTED.value
+                order.reason = f"No open position found for symbol {symbol} to exit."
+                self.db.save_order(order)
+                self._journal_event(
+                    event_type="ORDER_REJECTED",
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    payload={"client_order_id": cid, "reason": order.reason},
+                    message=f"Order {cid} rejected: {order.reason}",
+                )
+                return ExecutionResult(
+                    success=False,
+                    order_id=cid,
+                    status=OrderStatus.REJECTED,
+                    message=order.reason,
+                )
+
         passed, risk_msg = self.risk_governor.evaluate_order(
             order=order,
             open_positions=open_positions,
@@ -143,8 +310,14 @@ class PaperExecutor:
                 message=order.reason,
             )
 
-        # 3. Paper Order Fill Simulation (Executed at provided real market price)
-        fill_price = price
+        # 3. Paper Order Fill Simulation (Executed at provided real market price + slippage)
+        if side_val == OrderSide.BUY.value:
+            slip = self.entry_slippage if intent_val == OrderIntent.ENTRY.value else self.exit_slippage
+            fill_price = round(price + slip, 2)
+        else:
+            slip = self.entry_slippage if intent_val == OrderIntent.ENTRY.value else self.exit_slippage
+            fill_price = round(price - slip, 2)
+
         order.status = OrderStatus.FILLED.value
         order.fill_price = fill_price
         order.executed_at = now_iso
@@ -174,8 +347,16 @@ class PaperExecutor:
                 event_type="POSITION_OPENED",
                 strategy_id=strategy_id,
                 symbol=symbol,
-                payload={"position_id": position_id, "side": side_val, "qty": quantity, "price": fill_price},
-                message=f"Opened position {position_id} for {symbol} at {fill_price}",
+                payload={
+                    "position_id": position_id,
+                    "side": side_val,
+                    "qty": quantity,
+                    "price": fill_price,
+                    "quoted_price": price,
+                    "slippage": slip,
+                    "risk_profile_id": self.risk_profile_id,
+                },
+                message=f"Opened position {position_id} for {symbol} at {fill_price} (quoted {price}, slippage {slip})",
             )
         else:
             # EXIT intent: matched to existing open position for this symbol
@@ -194,8 +375,13 @@ class PaperExecutor:
             event_type="ORDER_FILLED",
             strategy_id=strategy_id,
             symbol=symbol,
-            payload={"client_order_id": cid, "fill_price": fill_price, "position_id": position_id},
-            message=f"Paper order {cid} filled at {fill_price}",
+            payload={
+                "client_order_id": cid,
+                "fill_price": fill_price,
+                "position_id": position_id,
+                "slippage": slip,
+            },
+            message=f"Paper order {cid} filled at {fill_price} (quoted {price}, slippage {slip})",
         )
 
         return ExecutionResult(
@@ -229,6 +415,10 @@ class PaperExecutor:
 
         now_ist = self.safety_guard.to_ist(current_dt)
         exit_side = OrderSide.SELL.value if pos.side == OrderSide.BUY.value else OrderSide.BUY.value
+        if exit_side == OrderSide.SELL.value:
+            actual_fill_price = round(exit_price - self.exit_slippage, 2)
+        else:
+            actual_fill_price = round(exit_price + self.exit_slippage, 2)
 
         # Submit exit order
         cid = f"exit_{uuid.uuid4().hex[:12]}"
@@ -241,7 +431,7 @@ class PaperExecutor:
             intent=OrderIntent.EXIT.value,
             quantity=pos.quantity,
             price=exit_price,
-            fill_price=exit_price,
+            fill_price=actual_fill_price,
             status=OrderStatus.FILLED.value,
             created_at=now_ist.isoformat(),
             executed_at=now_ist.isoformat(),
@@ -252,7 +442,7 @@ class PaperExecutor:
 
         self._close_position_record(
             pos=pos,
-            exit_price=exit_price,
+            exit_price=actual_fill_price,
             closed_at=now_ist.isoformat(),
             reason=reason,
         )
@@ -261,9 +451,9 @@ class PaperExecutor:
             success=True,
             order_id=cid,
             status=OrderStatus.FILLED,
-            fill_price=exit_price,
+            fill_price=actual_fill_price,
             position_id=position_id,
-            message=f"Position {position_id} closed at {exit_price} ({reason}).",
+            message=f"Position {position_id} closed at {actual_fill_price} ({reason}).",
         )
 
     def update_positions_on_candle(
@@ -339,19 +529,31 @@ class PaperExecutor:
         reason: str,
     ) -> None:
         """Calculate realized PnL and persist closed position."""
-        if str(pos.side) == OrderSide.BUY.value:
-            pnl = (exit_price - pos.entry_price) * pos.quantity
+        is_buy = str(pos.side) == OrderSide.BUY.value
+        if is_buy:
+            gross_pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
-            pnl = (pos.entry_price - exit_price) * pos.quantity
+            gross_pnl = (pos.entry_price - exit_price) * pos.quantity
+
+        charges = compute_option_charges(
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=pos.quantity,
+            brokerage_per_order=self.brokerage_per_order,
+            is_buy_entry=is_buy,
+            include_statutory_taxes=self.include_statutory_taxes,
+        )
+        net_pnl = round(gross_pnl - charges.total_charges, 2)
 
         pos.current_price = exit_price
         pos.closed_at = closed_at
         pos.status = PositionStatus.CLOSED.value
-        pos.realized_pnl = round(pnl, 2)
+        pos.realized_pnl = net_pnl
         self.db.save_position(pos)
 
         self.daily_realized_pnl += pos.realized_pnl
 
+        tax_portion = round(charges.total_charges - charges.brokerage, 2)
         self._journal_event(
             event_type="POSITION_CLOSED",
             strategy_id=pos.strategy_id,
@@ -359,10 +561,22 @@ class PaperExecutor:
             payload={
                 "position_id": pos.position_id,
                 "exit_price": exit_price,
+                "gross_pnl": round(gross_pnl, 2),
+                "brokerage": charges.brokerage,
+                "stt": charges.stt,
+                "txn_fee": charges.txn_fee,
+                "gst": charges.gst,
+                "stamp_duty": charges.stamp_duty,
+                "sebi_ipft": charges.sebi_ipft,
+                "total_charges": charges.total_charges,
                 "realized_pnl": pos.realized_pnl,
+                "risk_profile_id": self.risk_profile_id,
                 "reason": reason,
             },
-            message=f"Closed position {pos.position_id} with PnL {pos.realized_pnl:.2f} ({reason})",
+            message=(
+                f"Closed position {pos.position_id} with net PnL {pos.realized_pnl:.2f} "
+                f"(Gross: {gross_pnl:.2f}, Charges: {charges.total_charges:.2f} [Brok: {charges.brokerage:.2f}, Taxes: {tax_portion:.2f}]) [{reason}]"
+            ),
         )
 
     def _journal_event(

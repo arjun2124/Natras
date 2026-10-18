@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+import re
 from urllib.parse import parse_qs, urlparse
 
 from natras.data.session import IST
@@ -35,12 +36,41 @@ def _last_reset(now: datetime) -> datetime:
 
 
 def parse_auth_code(redirected_url: str) -> str:
-    '''Extract auth_code from the URL FYERS redirects to after login.'''
-    query = parse_qs(urlparse(redirected_url).query)
-    values = query.get('auth_code')
-    if not values or not values[0]:
+    '''Extract auth_code from the URL, query string, or accept raw code directly.'''
+    text = (redirected_url or '').strip()
+    if not text:
         raise FyersAuthError('No auth_code found in the redirected URL.')
-    return values[0]
+
+    # Clean surrounding quotes, angle brackets, and whitespace
+    text = text.strip('`"\'<> \r\n')
+
+    # 1. Regex search for auth_code=... or auth_code:... within text
+    match = re.search(r'auth_code\s*[:=]\s*([^&\s"\'<>]+)', text, re.IGNORECASE)
+    if match:
+        code = match.group(1).strip('`"\'<>')
+        if code:
+            return code
+
+    # 2. Parse standard URL query and fragment parameters
+    url_to_parse = text if '://' in text else f'http://{text}'
+    try:
+        parsed = urlparse(url_to_parse)
+        for q in (parsed.query, parsed.fragment):
+            if q:
+                qs = parse_qs(q)
+                if 'auth_code' in qs and qs['auth_code'] and qs['auth_code'][0]:
+                    return qs['auth_code'][0].strip('`"\'<>')
+    except Exception:
+        pass
+
+    # 3. Check if user passed the raw JWT/auth_code token directly
+    cleaned = text.strip()
+    if (' ' not in cleaned and '\n' not in cleaned and
+            not any(cleaned.startswith(p) for p in ('http://', 'https://', 'www.'))):
+        if cleaned.startswith('eyJ') or ('.' in cleaned and len(cleaned) >= 20) or len(cleaned) >= 30:
+            return cleaned
+
+    raise FyersAuthError('No auth_code found in the redirected URL.')
 
 
 @dataclass(frozen=True)

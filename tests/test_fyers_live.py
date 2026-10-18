@@ -172,3 +172,15 @@ def test_feed_subscribes_on_open():
     feed.start()
     captured['on_open']()
     assert sock.connected and sock.subscribed == ([SYM], 'SymbolUpdate')
+
+
+def test_fetch_candles_parses_7_element_row_with_oi():
+    """Verify that FYERS API v3 candle rows with Open Interest (7 elements) parse successfully."""
+    # Row format: [epoch, open, high, low, close, volume, open_interest]
+    row_with_oi = [epoch(13, 9, 15), 100, 105, 99, 102, 1000, 45200]
+    client = FakeClient([{'s': 'ok', 'candles': [row_with_oi]}])
+    candles = adapter(client).fetch_candles(SYM, '5', '2026-10-13', '2026-10-13', now=NOW)
+    assert len(candles) == 1
+    assert candles[0].close == 102
+    assert candles[0].volume == 1000
+    assert candles[0].timestamp == datetime(2026, 10, 13, 9, 15, tzinfo=IST)

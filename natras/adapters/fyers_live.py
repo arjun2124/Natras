@@ -8,6 +8,7 @@ The older NOT_IMPLEMENTED stub in fyers.py is intentionally left untouched.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -140,7 +141,10 @@ class FyersLiveAdapter:
         current = (now or datetime.now(IST)).astimezone(IST)
         delta = timedelta(minutes=CANDLE_TIMEFRAME_MINUTES)
         found: Dict[datetime, Candle] = {}
-        for chunk_start, chunk_end in _date_chunks(_to_date(range_from), _to_date(range_to)):
+        chunks = list(_date_chunks(_to_date(range_from), _to_date(range_to)))
+        for idx, (chunk_start, chunk_end) in enumerate(chunks):
+            if idx > 0:
+                time.sleep(0.02)  # Throttle to stay safely within FYERS rate limits (50 req/min)
             resp = self.client.history({
                 'symbol': symbol,
                 'resolution': str(resolution),
@@ -153,7 +157,7 @@ class FyersLiveAdapter:
                 continue
             _require_ok(resp, 'history')
             for row in resp.get('candles', []):
-                if not isinstance(row, (list, tuple)) or len(row) != 6:
+                if not isinstance(row, (list, tuple)) or len(row) not in (6, 7):
                     raise FyersDataError(f'Malformed candle row: {row!r}')
                 ts = datetime.fromtimestamp(row[0], IST)
                 candle = validate_candle(symbol, ts, row[1], row[2], row[3], row[4], row[5])
