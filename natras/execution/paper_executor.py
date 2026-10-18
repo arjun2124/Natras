@@ -41,6 +41,73 @@ class ExecutionResult:
     position_id: Optional[str] = None
 
 
+@dataclass
+class OptionChargesBreakdown:
+    """Official FYERS and Indian regulatory charge schedule for NSE Equity Options."""
+    brokerage: float = 0.0
+    stt: float = 0.0
+    txn_fee: float = 0.0
+    gst: float = 0.0
+    stamp_duty: float = 0.0
+    sebi_ipft: float = 0.0
+    total_charges: float = 0.0
+
+
+def compute_option_charges(
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    brokerage_per_order: float = 20.0,
+    is_buy_entry: bool = True,
+    include_statutory_taxes: bool = True,
+) -> OptionChargesBreakdown:
+    """Compute official FYERS & NSE Option trading charges and statutory taxes.
+
+    Specifications (NSE Equity Options):
+    - Brokerage: Flat ₹20 per executed order (₹40 round-trip standard for FYERS)
+    - STT (Securities Transaction Tax): 0.1% on sell-side premium turnover (Finance Act 2024)
+    - NSE Exchange Turnover Charges: 0.03503% on total premium turnover
+    - Stamp Duty: 0.003% on buy-side premium turnover
+    - SEBI Turnover Fee: ₹10 per Crore (0.0001% on total turnover)
+    - IPFT (Investor Protection Fund): ₹50 per Crore (0.0005% on total turnover)
+    - GST: 18% on (Brokerage + NSE Txn Charges + IPFT)
+    """
+    total_brokerage = round(brokerage_per_order * 2.0, 2)
+    if not include_statutory_taxes or total_brokerage == 0.0:
+        return OptionChargesBreakdown(
+            brokerage=total_brokerage,
+            total_charges=total_brokerage,
+        )
+
+    buy_price = entry_price if is_buy_entry else exit_price
+    sell_price = exit_price if is_buy_entry else entry_price
+
+    buy_turnover = buy_price * quantity
+    sell_turnover = sell_price * quantity
+    total_turnover = buy_turnover + sell_turnover
+
+    stt = round(sell_turnover * 0.001, 2)
+    txn_fee = round(total_turnover * 0.0003503, 2)
+    stamp_duty = round(buy_turnover * 0.00003, 2)
+    sebi_fee = round(total_turnover * 0.000001, 2)
+    ipft = round(total_turnover * 0.000005, 2)
+    gst = round((total_brokerage + txn_fee + ipft) * 0.18, 2)
+
+    total_charges = round(
+        total_brokerage + stt + txn_fee + stamp_duty + sebi_fee + ipft + gst, 2
+    )
+    return OptionChargesBreakdown(
+        brokerage=total_brokerage,
+        stt=stt,
+        txn_fee=txn_fee,
+        gst=gst,
+        stamp_duty=stamp_duty,
+        sebi_ipft=round(sebi_fee + ipft, 2),
+        total_charges=total_charges,
+    )
+
+
+
 class PaperExecutor:
     """Manages paper order execution, simulated fills, and position lifecycle.
 
@@ -62,6 +129,7 @@ class PaperExecutor:
         exit_slippage: float = 0.0,
         brokerage_per_order: float = 0.0,
         risk_profile_id: str = "v2.2.0-research-momentum-wick-default",
+        include_statutory_taxes: bool = True,
     ) -> None:
         self.db = db
         self.safety_guard = safety_guard
@@ -71,6 +139,7 @@ class PaperExecutor:
         self.exit_slippage = exit_slippage
         self.brokerage_per_order = brokerage_per_order
         self.risk_profile_id = risk_profile_id
+        self.include_statutory_taxes = include_statutory_taxes
         self.daily_realized_pnl = 0.0
         self.daily_trades_count = 0
         self._recover_daily_counters()
@@ -108,8 +177,9 @@ class PaperExecutor:
         safety_guard: SafetyGuard,
         risk_governor: RiskGovernor,
         settings: Settings,
+        include_statutory_taxes: bool = True,
     ) -> "PaperExecutor":
-        """Factory initializing PaperExecutor with realistic slippage and brokerage."""
+        """Factory initializing PaperExecutor with realistic slippage, brokerage, and statutory taxes."""
         return cls(
             db=db,
             safety_guard=safety_guard,
@@ -118,6 +188,7 @@ class PaperExecutor:
             entry_slippage=0.50,
             exit_slippage=0.50,
             brokerage_per_order=20.0,
+            include_statutory_taxes=include_statutory_taxes,
         )
 
     def submit_order(
@@ -458,13 +529,21 @@ class PaperExecutor:
         reason: str,
     ) -> None:
         """Calculate realized PnL and persist closed position."""
-        if str(pos.side) == OrderSide.BUY.value:
+        is_buy = str(pos.side) == OrderSide.BUY.value
+        if is_buy:
             gross_pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
             gross_pnl = (pos.entry_price - exit_price) * pos.quantity
 
-        total_brokerage = round(self.brokerage_per_order * 2.0, 2)  # ₹20 entry + ₹20 exit
-        net_pnl = round(gross_pnl - total_brokerage, 2)
+        charges = compute_option_charges(
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=pos.quantity,
+            brokerage_per_order=self.brokerage_per_order,
+            is_buy_entry=is_buy,
+            include_statutory_taxes=self.include_statutory_taxes,
+        )
+        net_pnl = round(gross_pnl - charges.total_charges, 2)
 
         pos.current_price = exit_price
         pos.closed_at = closed_at
@@ -474,6 +553,7 @@ class PaperExecutor:
 
         self.daily_realized_pnl += pos.realized_pnl
 
+        tax_portion = round(charges.total_charges - charges.brokerage, 2)
         self._journal_event(
             event_type="POSITION_CLOSED",
             strategy_id=pos.strategy_id,
@@ -482,14 +562,20 @@ class PaperExecutor:
                 "position_id": pos.position_id,
                 "exit_price": exit_price,
                 "gross_pnl": round(gross_pnl, 2),
-                "brokerage": total_brokerage,
+                "brokerage": charges.brokerage,
+                "stt": charges.stt,
+                "txn_fee": charges.txn_fee,
+                "gst": charges.gst,
+                "stamp_duty": charges.stamp_duty,
+                "sebi_ipft": charges.sebi_ipft,
+                "total_charges": charges.total_charges,
                 "realized_pnl": pos.realized_pnl,
                 "risk_profile_id": self.risk_profile_id,
                 "reason": reason,
             },
             message=(
                 f"Closed position {pos.position_id} with net PnL {pos.realized_pnl:.2f} "
-                f"(Gross: {gross_pnl:.2f}, Brokerage: {total_brokerage:.2f}) [{reason}]"
+                f"(Gross: {gross_pnl:.2f}, Charges: {charges.total_charges:.2f} [Brok: {charges.brokerage:.2f}, Taxes: {tax_portion:.2f}]) [{reason}]"
             ),
         )
 

@@ -213,10 +213,11 @@ class PaperRuntime:
            - Notifies Telegram.
         4. Updates trailing stops on any existing positions.
         """
-        # Always feed spot candle to shadow strategy engine
+        # Always feed spot candle to shadow strategy engine with Market Intelligence context
         if self.shadow_engine:
             try:
-                self.shadow_engine.on_candle(candle)
+                mi_context = self.db.get_latest_market_intelligence() if self.db else None
+                self.shadow_engine.on_candle(candle, context=mi_context)
             except Exception as exc:
                 logger.error("Shadow engine candle evaluation error: %s", exc)
 

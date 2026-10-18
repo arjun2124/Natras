@@ -10,6 +10,7 @@ Implements Section 11 of the NAT RAS Master Project Draft:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -105,6 +106,8 @@ class TelegramLiveBot:
             return self._cmd_market_intel()
         elif cmd in ("/shadow_status", "/shadow_candidates", "/shadow"):
             return self._cmd_shadow_status()
+        elif cmd in ("/shadow_audit", "/walkforward"):
+            return self._cmd_shadow_audit(arg)
         elif cmd == "/promotion_requests":
             return self._cmd_promotion_requests()
         elif cmd == "/approve":
@@ -343,16 +346,50 @@ class TelegramLiveBot:
                 if c.active_position:
                     pos_info = f"Virtual {c.active_position['direction']} @ {c.active_position['spot_entry']:.2f}"
                 promo_tag = " 🌟 [READY FOR /approve]" if c.status == "PROMOTION_CANDIDATE" else ""
+
+                bt_info = "Pending background 2023-2026 audit"
+                if getattr(c, "backtest_metrics", None):
+                    bm = c.backtest_metrics
+                    bt_info = f"Rs {bm.get('total_net_pnl', 0.0):,.2f} (PF: {bm.get('profit_factor', 0.0):.2f}, Consistency: {bm.get('consistency_pct', 0.0):.0f}%)"
+
+                origin_str = getattr(c, "origin", "LIVE_MARKET_DATA")
                 lines.append(
                     f"• ID: `{c.candidate_id}`\n"
                     f"  Name: {c.name}{promo_tag}\n"
-                    f"  Status: {c.status} | Virtual Position: {pos_info}\n"
-                    f"  Sessions: {c.sessions_evaluated} | Trades: {c.trade_count} (Wins: {c.win_count})\n"
-                    f"  Net PnL: Rs {c.net_pnl:,.2f} | PF: {c.profit_factor:.2f}"
+                    f"  Origin: {origin_str} | Status: {c.status}\n"
+                    f"  Position: {pos_info}\n"
+                    f"  Forward Live: {c.trade_count} trades (Wins: {c.win_count}) | PnL: Rs {c.net_pnl:,.2f} (PF: {c.profit_factor:.2f})\n"
+                    f"  2023-2026 Backtest: {bt_info}"
                 )
             return "\n\n".join(lines)
         except Exception as exc:
             return f"Shadow status error: {exc}"
+
+    def _cmd_shadow_audit(self, arg: str = "") -> str:
+        report_dir = Path("runtime_data") / "reports" / "walk_forward"
+        summary_file = report_dir / "summary.json"
+        if not summary_file.exists():
+            return (
+                "🧪 *SHADOW STRATEGIES WALK-FORWARD AUDIT*\n"
+                "• No historical audit report generated yet.\n"
+                "• Walk-forward batch verification (6-month calibration + out-of-sample batches) can be triggered via CLI or tests."
+            )
+        try:
+            data = json.loads(summary_file.read_text(encoding="utf-8"))
+            lines = ["🧪 *SHADOW STRATEGIES WALK-FORWARD AUDIT (2023-2026)*"]
+            for strat_name, res in data.items():
+                pnl = res.get("total_net_pnl", 0.0)
+                wr = res.get("win_rate", 0.0)
+                trades = res.get("total_trades", 0)
+                status = "ROBUST" if res.get("robust") else "REVIEW"
+                lines.append(
+                    f"• *{strat_name}* [{status}]\n"
+                    f"  Trades: {trades} | Win Rate: {wr:.1f}%\n"
+                    f"  Net PnL: Rs {pnl:,.2f} | Out-of-Sample Batches: {res.get('batch_count', 0)}"
+                )
+            return "\n\n".join(lines)
+        except Exception as exc:
+            return f"Walk-forward audit read error: {exc}"
 
     def _cmd_promotion_requests(self) -> str:
         try:
@@ -428,6 +465,7 @@ class TelegramLiveBot:
             "/strategy_status - Baseline strategy parameters & health\n"
             "/market_intel - Market regime, global sentiment, macro events\n"
             "/shadow_status - Live shadow candidate variants and metrics\n"
+            "/shadow_audit - Historical walk-forward backtest results (2023-2026)\n"
             "/promotion_requests - Pending strategy promotions for next session\n"
             "/approve <id> - Approve shadow candidate for N+1 session\n"
             "/reject <id> - Reject pending candidate\n"

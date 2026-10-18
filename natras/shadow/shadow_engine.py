@@ -21,13 +21,45 @@ from typing import Any, Dict, List, Optional
 
 from natras.data.candle_engine import Candle
 from natras.data.session import IST
+from natras.research.walk_forward import WalkForwardBatchValidator, WalkForwardReport
 from natras.risk.strategy_profiles import StrategyRiskProfile, get_default_risk_profile
 from natras.strategies.base import BaseStrategy, Signal
+from natras.strategies.breadth_trend_flow import BreadthInstitutionalFlowStrategy
 from natras.strategies.momentum_wick import MomentumWickStrategy, SteppedTrailingStop
+from natras.strategies.options_pcr_reversion import OptionsMaxPainPCRReversionStrategy
+from natras.strategies.regime_momentum_wick import RegimeAdaptiveMomentumWickStrategy
 
 logger = logging.getLogger(__name__)
 
 SHADOW_STORE_PATH = Path("runtime_data") / "shadow" / "shadow_registry.json"
+
+STRATEGY_CLASS_MAP: Dict[str, Any] = {
+    "RegimeAdaptiveMomentumWickStrategy": RegimeAdaptiveMomentumWickStrategy,
+    "OptionsMaxPainPCRReversionStrategy": OptionsMaxPainPCRReversionStrategy,
+    "BreadthInstitutionalFlowStrategy": BreadthInstitutionalFlowStrategy,
+    "MomentumWickStrategy": MomentumWickStrategy,
+}
+
+DEFAULT_PILLARS: List[Dict[str, Any]] = [
+    {
+        "name": "Candidate_1_Live_Enhancer (Regime_Adaptive_Wick)",
+        "strategy_class_name": "RegimeAdaptiveMomentumWickStrategy",
+        "role": "LIVE_BASELINE_ENHANCER",
+        "param_overrides": {},
+    },
+    {
+        "name": "Candidate_2_Options_Gravity (PCR_MaxPain_Reversion)",
+        "strategy_class_name": "OptionsMaxPainPCRReversionStrategy",
+        "role": "DIVERSE_OPTIONS_GRAVITY",
+        "param_overrides": {},
+    },
+    {
+        "name": "Candidate_3_Institutional_Flow (SectorBreadth_EMA)",
+        "strategy_class_name": "BreadthInstitutionalFlowStrategy",
+        "role": "DIVERSE_INSTITUTIONAL_BREADTH",
+        "param_overrides": {},
+    },
+]
 
 
 @dataclass
@@ -54,6 +86,7 @@ class ShadowCandidate:
     parameters: Dict[str, Any]
     status: str  # SHADOW_LIVE, EVALUATED, PROMOTION_CANDIDATE, REMOVED_NO_IMPROVEMENT_3_TO_5_SESSIONS, INSUFFICIENT_DATA
     created_at: str
+    strategy_class_name: str = "MomentumWickStrategy"
     sessions_evaluated: int = 0
     trade_count: int = 0
     win_count: int = 0
@@ -64,28 +97,16 @@ class ShadowCandidate:
     recent_session_dates: List[str] = field(default_factory=list)
     trades: List[ShadowTrade] = field(default_factory=list)
     active_position: Optional[Dict[str, Any]] = None
+    origin: str = "LIVE_MARKET_DATA"  # LIVE_MARKET_DATA or HISTORICAL_CALIBRATION
+    backtest_metrics: Optional[Dict[str, Any]] = None
+    backtest_status: str = "PENDING_AUDIT"  # PENDING_AUDIT, AUDITED, AUDIT_FAILED
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 class ShadowEngine:
-    """Manages virtual execution of shadow strategy candidates."""
-
-    DEFAULT_VARIANTS = [
-        {
-            "name": "Experimental_Aggressive_Body_0.40",
-            "param_overrides": {"min_body_ratio": 0.40},
-        },
-        {
-            "name": "Experimental_High_Conviction_0.60",
-            "param_overrides": {"min_body_ratio": 0.60},
-        },
-        {
-            "name": "Experimental_Tight_Trail_6_2",
-            "param_overrides": {"trail_trigger_pp": 6.0, "trail_gap_pp": 2.0},
-        },
-    ]
+    """Manages virtual execution of shadow strategy candidates with Market Intelligence integration."""
 
     def __init__(
         self,
@@ -96,21 +117,32 @@ class ShadowEngine:
         self.risk_profile = risk_profile or get_default_risk_profile()
         self.store_path = Path(store_path)
         self.candidates: Dict[str, ShadowCandidate] = {}
-        self.active_strategies: Dict[str, MomentumWickStrategy] = {}
+        self.active_strategies: Dict[str, BaseStrategy] = {}
         self.active_positions: Dict[str, Dict[str, Any]] = {}
         self._load()
         if auto_seed and not self.candidates:
             self.ensure_default_candidates()
 
+    def get_latest_market_intelligence(self) -> Optional[Dict[str, Any]]:
+        """Load freshest market intelligence report from JSON or database."""
+        report_path = Path("runtime_data") / "reports" / "market_intelligence" / "latest.json"
+        if report_path.exists():
+            try:
+                return json.loads(report_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return None
+
     def ensure_default_candidates(self) -> List[ShadowCandidate]:
-        """Ensure standard research variants are registered if none exist."""
+        """Ensure the 3 diverse strategy pillars are registered."""
         if self.candidates:
             return list(self.candidates.values())
         added = []
-        for v in self.DEFAULT_VARIANTS:
+        for p in DEFAULT_PILLARS:
             cand = self.register_variant(
-                name=v["name"],
-                param_overrides=v["param_overrides"],
+                name=p["name"],
+                param_overrides=p.get("param_overrides", {}),
+                strategy_class_name=p.get("strategy_class_name", "MomentumWickStrategy"),
             )
             added.append(cand)
         return added
@@ -159,28 +191,41 @@ class ShadowEngine:
     def register_variant(
         self,
         name: str,
-        param_overrides: Dict[str, Any],
+        param_overrides: Optional[Dict[str, Any]] = None,
         parent_id: str = "v2.2.0-RESEARCH-MOMENTUM-WICK",
+        strategy_class_name: str = "MomentumWickStrategy",
     ) -> ShadowCandidate:
         """Register a new experimental variant to run in shadow mode."""
+        if param_overrides is None:
+            param_overrides = {}
         candidate_id = f"shadow_{uuid.uuid4().hex[:8]}"
-        strat = MomentumWickStrategy(strategy_id=candidate_id, **param_overrides)
+        strat_cls = STRATEGY_CLASS_MAP.get(strategy_class_name, MomentumWickStrategy)
+        strat = strat_cls(strategy_id=candidate_id, **param_overrides)
         candidate = ShadowCandidate(
             candidate_id=candidate_id,
             parent_strategy=parent_id,
             name=name,
-            parameters=strat.get_status()["parameter_defaults"],
+            parameters=strat.get_status().get("parameter_defaults", {}),
             status="SHADOW_LIVE",
             created_at=datetime.now(IST).isoformat(),
+            strategy_class_name=strategy_class_name,
         )
         self.candidates[candidate_id] = candidate
         self.active_strategies[candidate_id] = strat
         self._save()
-        logger.info("Registered shadow candidate %s (%s)", candidate_id, name)
+        logger.info(
+            "Registered shadow candidate %s (%s) [%s]",
+            candidate_id,
+            name,
+            strategy_class_name,
+        )
         return candidate
 
-    def on_candle(self, candle: Candle) -> None:
+    def on_candle(self, candle: Candle, context: Optional[Dict[str, Any]] = None) -> None:
         """Evaluate incoming completed candle across all active shadow candidates."""
+        if context is None:
+            context = self.get_latest_market_intelligence()
+
         for cid, strat in self.active_strategies.items():
             candidate = self.candidates.get(cid)
             if not candidate or candidate.status != "SHADOW_LIVE":
@@ -209,7 +254,7 @@ class ShadowEngine:
                     candidate.active_position["current_stop_pp"] = ts.current_stop_pp
 
                 is_stopped = ts.is_stopped_out(worst_move)
-                is_eod = strat.is_eod_square_off_time(candle.timestamp)
+                is_eod = strat.is_eod_square_off_time(candle.timestamp) if hasattr(strat, "is_eod_square_off_time") else False
 
                 if is_stopped or is_eod:
                     exit_reason = "EOD_SQUARE_OFF" if is_eod and not is_stopped else "TRAILING_STOP_BREACH"
@@ -259,13 +304,19 @@ class ShadowEngine:
 
             # 2. Check for new virtual signal
             if active_pos is None:
-                signals = strat.on_candle(candle)
+                signals = strat.on_candle(candle, context=context)
                 if signals:
                     sig = signals[0]
                     direction = sig.metadata.get("instrument_type", "CE")
                     quoted_entry = 100.0
                     fill_entry = quoted_entry + self.risk_profile.entry_slippage
-                    ts = strat.create_trailing_stop()
+                    if hasattr(strat, "create_trailing_stop"):
+                        try:
+                            ts = strat.create_trailing_stop(context=context)
+                        except TypeError:
+                            ts = strat.create_trailing_stop()
+                    else:
+                        ts = SteppedTrailingStop()
 
                     pos = {
                         "trade_id": f"st_{uuid.uuid4().hex[:8]}",
@@ -334,6 +385,60 @@ class ShadowEngine:
                     candidate.profit_factor,
                 )
 
+    def run_walkforward_audit(
+        self,
+        candidate_id: str,
+        db_path: Path | str = Path("data") / "market.db",
+    ) -> WalkForwardReport:
+        """Execute historical walk-forward batch validation (6-month calibration + out-of-sample batches)."""
+        candidate = self.candidates.get(candidate_id)
+        if not candidate:
+            raise ValueError(f"Candidate {candidate_id} not found in shadow registry")
+        strat_cls = STRATEGY_CLASS_MAP.get(
+            candidate.strategy_class_name, MomentumWickStrategy
+        )
+        strategy = strat_cls(strategy_id=candidate_id, **candidate.parameters)
+        validator = WalkForwardBatchValidator(db_path=db_path)
+        report = validator.run(strategy)
+        candidate.backtest_metrics = {
+            "total_trades": report.total_trades,
+            "win_rate": report.total_win_rate,
+            "total_net_pnl": report.total_net_pnl,
+            "profit_factor": report.overall_profit_factor,
+            "consistency_pct": report.consistency_percentage,
+            "profitable_batches": report.profitable_batches,
+            "total_batches": report.batches_evaluated,
+            "certification_status": report.certification_status,
+        }
+        candidate.backtest_status = "AUDITED"
+        self._evaluate_lifecycle(candidate)
+        self._save()
+        return report
+
+    def run_background_audit_async(
+        self,
+        candidate_id: str,
+        db_path: Path | str = Path("data") / "market.db",
+        on_complete: Optional[Any] = None,
+    ) -> Any:
+        """Run historical walk-forward audit in background daemon thread without blocking live execution."""
+        import threading
+
+        def _target():
+            try:
+                rep = self.run_walkforward_audit(candidate_id, db_path=db_path)
+                if on_complete:
+                    try:
+                        on_complete(rep)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.error("Async background audit failed for %s: %s", candidate_id, exc)
+
+        t = threading.Thread(target=_target, name=f"AuditThread_{candidate_id}", daemon=True)
+        t.start()
+        return t
+
     def _save(self) -> None:
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         data = {cid: c.to_dict() for cid, c in self.candidates.items()}
@@ -344,21 +449,27 @@ class ShadowEngine:
             return
         try:
             data = json.loads(self.store_path.read_text(encoding="utf-8"))
+            known_fields = set(ShadowCandidate.__dataclass_fields__.keys())
             for cid, d in data.items():
                 trades = [ShadowTrade(**t) for t in d.get("trades", [])]
                 d["trades"] = trades
-                cand = ShadowCandidate(**d)
+                filtered_d = {k: v for k, v in d.items() if k in known_fields}
+                cand = ShadowCandidate(**filtered_d)
                 self.candidates[cid] = cand
                 if cand.status == "SHADOW_LIVE":
-                    strat = MomentumWickStrategy(
-                        strategy_id=cid, **cand.parameters
+                    strat_cls = STRATEGY_CLASS_MAP.get(
+                        cand.strategy_class_name, MomentumWickStrategy
                     )
+                    strat = strat_cls(strategy_id=cid, **cand.parameters)
                     self.active_strategies[cid] = strat
                     if cand.active_position:
-                        ts = strat.create_trailing_stop()
+                        if hasattr(strat, "create_trailing_stop"):
+                            ts = strat.create_trailing_stop()
+                        else:
+                            ts = SteppedTrailingStop()
                         ts.peak_fav_pp = cand.active_position.get("peak_fav_pp", 0.0)
                         ts.current_stop_pp = cand.active_position.get(
-                            "current_stop_pp", -abs(strat.initial_stop_pp)
+                            "current_stop_pp", -abs(getattr(strat, "initial_stop_pp", 15.0))
                         )
                         self.active_positions[cid] = {
                             **cand.active_position,

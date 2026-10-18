@@ -45,7 +45,7 @@ DB_PATH = Path('data') / 'market.db'
 WINDOW_START = (7, 0)
 WINDOW_END = (15, 30)
 LOGIN_TIMEOUT_SECONDS = 900
-MAX_COLLECTOR_RESTARTS = 3
+MAX_COLLECTOR_RESTARTS = 10
 LOCK_FRESH_SECONDS = 90
 
 log = logging.getLogger('natras.autostart')
@@ -341,35 +341,83 @@ def run_collector(notifier: Notifier, force: bool = False) -> None:
         if not healer.check_internet():
             healer.wait_for_network_recovery(max_wait_seconds=300.0)
 
+        # Clear stale heartbeat file from previous runs or days
+        healer.clear_heartbeat()
+
         with open(LOG_PATH.parent / 'collector.log', 'a', encoding='utf-8') as out:
             proc = subprocess.Popen(
                 [sys.executable, '-m', 'natras.cli.collect'], stdout=out, stderr=subprocess.STDOUT
             )
+            proc_start_time = time.time()
+            STARTUP_GRACE_PERIOD_SECONDS = 120.0
+            last_valid_heartbeat_time = proc_start_time
+            has_seen_heartbeat = False
+            consecutive_stalls = 0
+
             # Supervisor watchdog loop: check every 10 seconds
             while proc.poll() is None:
                 touch_lock()
                 # Check for frozen / stalled process via heartbeat
-                is_fresh, age = healer.is_heartbeat_healthy(max_age_seconds=180.0)
-                if age > 180.0 and in_window(datetime.now(IST)):
+                is_fresh, age = healer.is_heartbeat_healthy(max_age_seconds=180.0, expected_pid=proc.pid)
+                proc_age = time.time() - proc_start_time
+
+                if is_fresh or age >= 0:
+                    has_seen_heartbeat = True
+                    last_valid_heartbeat_time = time.time()
+                    consecutive_stalls = 0
+
+                # Allow grace period for startup, backfill, and runtime initialization
+                if proc_age < STARTUP_GRACE_PERIOD_SECONDS and not has_seen_heartbeat:
+                    time.sleep(10)
+                    continue
+
+                time_since_hb = time.time() - last_valid_heartbeat_time
+                if has_seen_heartbeat:
+                    is_stalled = (time_since_hb > 180.0)
+                else:
+                    is_stalled = (proc_age > STARTUP_GRACE_PERIOD_SECONDS)
+
+                if is_stalled:
+                    consecutive_stalls += 1
+                else:
+                    consecutive_stalls = 0
+
+                # Require 3 consecutive confirmations (30s) before declaring feed stall to avoid transient false positives
+                if consecutive_stalls >= 3 and in_window(datetime.now(IST)):
+                    stall_age = time_since_hb if has_seen_heartbeat else proc_age
                     healer.record_incident(
                         category="FEED_STALL",
-                        action_taken=f"Terminated frozen collector process PID {proc.pid} (heartbeat age {age:.0f}s) and auto-restarting",
+                        action_taken=f"Terminated frozen collector process PID {proc.pid} (heartbeat age {stall_age:.0f}s) and auto-restarting",
                         details="Collector process became unresponsive during market hours",
                         severity="WARNING",
                         notify_telegram=True,
                     )
                     try:
                         proc.kill()
-                    except OSError:
+                        proc.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
                         pass
                     break
                 time.sleep(10)
 
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
         if proc.returncode == 0:
             break
 
+        # Reset restart counter if process ran stably for at least 10 minutes
+        if (time.time() - proc_start_time) > 600.0:
+            restarts = 0
+
         restarts += 1
-        if proc.returncode in (4294967295, -1):
+        if proc.returncode in (4294967295, -1, 15, -9, -15, None):
             details = "Collector process was recycled/restarted."
             sev = "INFO"
         else:
@@ -406,6 +454,16 @@ def end_of_day_summary(notifier: Notifier) -> None:
 
 def main() -> int:
     load_env()
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -445,6 +503,7 @@ def main() -> int:
             LOCK_PATH.unlink()
         except OSError:
             pass
+        AutoHealer.get_instance().clear_heartbeat()
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Unit tests for the AutoHealer security and self-repair engine."""
 
 import json
+import os
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -96,6 +97,22 @@ def test_heartbeat_monitoring(tmp_path):
     # Test stale
     healthy_stale, _ = healer.is_heartbeat_healthy(max_age_seconds=0.0)
     assert not healthy_stale
+
+    # Test expected_pid matching and mismatching
+    my_pid = os.getpid()
+    healthy_pid, _ = healer.is_heartbeat_healthy(max_age_seconds=60.0, expected_pid=my_pid)
+    assert healthy_pid
+
+    mismatch_pid, age_mismatch = healer.is_heartbeat_healthy(max_age_seconds=60.0, expected_pid=99999999)
+    assert not mismatch_pid
+    assert age_mismatch == -1.0
+
+    # Test clear_heartbeat
+    healer.clear_heartbeat()
+    assert not hb_file.exists()
+    healthy_cleared, age_cleared = healer.is_heartbeat_healthy(max_age_seconds=60.0)
+    assert not healthy_cleared
+    assert age_cleared == -1.0
 
 
 def test_clear_stale_lock(tmp_path):

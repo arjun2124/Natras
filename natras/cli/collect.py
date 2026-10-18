@@ -47,6 +47,8 @@ def _save(db, candle, source):
 
 def main() -> int:
     load_env()
+    healer = AutoHealer.get_instance()
+    healer.write_heartbeat({"status": "INITIALIZING"})
     symbols = sys.argv[1:] or DEFAULT_SYMBOLS
     creds = FyersCredentials.from_env()
     token = FyersAuthenticator(creds).get_access_token()
@@ -98,6 +100,18 @@ def main() -> int:
         print('Paper trading runtime and Telegram command listener active.', flush=True)
         if paper_runtime.shadow_engine:
             print(f'Shadow strategy engine loaded ({len(paper_runtime.shadow_engine.candidates)} variants active).', flush=True)
+
+        from natras.shadow.background_worker import ShadowResearchWorker
+        research_worker = None
+        if paper_runtime and paper_runtime.shadow_engine:
+            research_worker = ShadowResearchWorker(
+                shadow_engine=paper_runtime.shadow_engine,
+                db_path=DB_PATH,
+                telegram_notifier=telegram_bot.send_message if telegram_bot else None,
+            )
+            research_worker.start()
+            print('Autonomous Shadow Research Worker active in background.', flush=True)
+
         print('AutoHealer silent security & self-repair layer active.', flush=True)
     except Exception as exc:
         print(f'Warning: Runtime extensions skipped: {exc}', flush=True)
@@ -105,6 +119,7 @@ def main() -> int:
         natras_db = None
         telegram_bot = None
         paper_runtime = None
+        research_worker = None
         healer = AutoHealer.get_instance()
 
     def on_candle(c):
@@ -174,6 +189,8 @@ def main() -> int:
 
             time.sleep(2)
     finally:
+        if research_worker:
+            research_worker.stop()
         feed.stop()
         now = datetime.now(IST)
         # Preserve active positions on mid-day restart; only square off at end of day (15:00+)

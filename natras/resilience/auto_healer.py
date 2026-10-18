@@ -252,21 +252,44 @@ class AutoHealer:
                 "status": "HEALTHY",
                 **(extra_info or {}),
             }
-            self.heartbeat_path.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_path = self.heartbeat_path.with_name(f"{self.heartbeat_path.stem}_{os.getpid()}.tmp")
+            tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_path.replace(self.heartbeat_path)
         except Exception as exc:
             self.logger.warning("Could not write heartbeat: %s", exc)
 
-    def is_heartbeat_healthy(self, max_age_seconds: float = 120.0) -> Tuple[bool, float]:
-        """Check if background worker has updated its heartbeat recently."""
+    def clear_heartbeat(self) -> None:
+        """Remove any existing heartbeat file (e.g. before spawning a new worker)."""
+        try:
+            if self.heartbeat_path.exists():
+                self.heartbeat_path.unlink()
+        except OSError:
+            pass
+
+    def is_heartbeat_healthy(
+        self, max_age_seconds: float = 120.0, expected_pid: Optional[int] = None
+    ) -> Tuple[bool, float]:
+        """Check if background worker has updated its heartbeat recently.
+
+        If expected_pid is provided, only heartbeats from that PID are considered valid;
+        heartbeats from prior runs or other processes are ignored as stale.
+        """
         if not self.heartbeat_path.exists():
             return False, -1.0
-        try:
-            data = json.loads(self.heartbeat_path.read_text(encoding="utf-8"))
-            epoch = data.get("epoch", 0.0)
-            age = time.time() - epoch
-            return (age <= max_age_seconds), age
-        except Exception:
-            return False, -1.0
+        for attempt in range(3):
+            try:
+                data = json.loads(self.heartbeat_path.read_text(encoding="utf-8"))
+                if expected_pid is not None and data.get("pid") != expected_pid:
+                    return False, -1.0
+                epoch = data.get("epoch", 0.0)
+                age = time.time() - epoch
+                return (age <= max_age_seconds), age
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                return False, -1.0
+        return False, -1.0
 
     # -------------------------------------------------------------------------
     # 4. Exception Containment & Guarded Execution
